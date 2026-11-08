@@ -162,8 +162,12 @@ Setup (you do the pairing by hand, once; orca-mcp never pairs and stores nothing
 `orca_status` then says `external coordinator on (environment this-mac)`. What changes:
 
 - `orca_run_create` runs `orca orchestration run-create --objective <t> --external --environment this-mac`,
-  and every coordinator call (`task-create`, `worker-start`, `check`, `send`) carries
-  `--environment this-mac`. Create the Run first: in this mode `worker-start` makes none.
+  and every other orca call of every tool (reads, waits, terminals, worktrees, repos, search and the
+  probes) carries `--environment this-mac`, so nothing goes to local Orca meanwhile. Create the Run
+  first: in this mode `worker-start` makes none.
+- Repo and worktree paths go as `path:<abs>` selectors, which Orca resolves on the paired host. With an
+  environment on another machine, pass paths as they are on that host; the `ORCA_MCP_ROOTS` check
+  still runs here, on the local path.
 - An external coordinator has no workspace of its own, so Orca refuses `--worktree new-top-level`
   for it. `orca_worker_start` therefore creates the worktree first
   (`orca worktree create ... --environment this-mac`, with the owner tag) and starts the worker
@@ -179,7 +183,10 @@ Setup (you do the pairing by hand, once; orca-mcp never pairs and stores nothing
 The environment name goes only on argv. The child process gets no `ORCA_ENVIRONMENT`,
 `ORCA_PAIRING_CODE` or `ORCA_MCP_ENVIRONMENT` from the parent, so no other saved environment is
 used by accident. Without `ORCA_MCP_ENVIRONMENT`, or when that environment's Orca lacks the
-capability (or is unreachable), every call behaves exactly as before and `orca_status` says why.
+capability, every call behaves exactly as before and `orca_status` says why. When the environment
+cannot be reached (not running, misnamed), every tool fails closed with an error naming it and the
+reason (code `environment_unavailable`); it is asked again after 30 s. Once a read succeeds the mode
+holds for the server's lifetime, so a session never switches between the paired Orca and the local one.
 The flag names live in one adapter (`src/capabilities.ts`).
 
 ## Embedding
