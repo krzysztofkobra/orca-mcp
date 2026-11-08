@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { buildTools, type ToolDeps } from "./tools.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 /**
  * An MCP server with every Orca tool registered. Embedders pass their own deps

@@ -121,7 +121,9 @@ export function runOrca(args: readonly string[], opts: OrcaOptions = {}): Promis
   const src = opts.env ?? process.env;
   // A coordinator on the same computer as Orca saves its pairing in a profile of its own:
   // Orca refuses to save a pairing code into the profile of the runtime it points at.
-  const profile = src.ORCA_MCP_CLIENT_PROFILE?.trim();
+  // MCP client configs pass env values verbatim, so a leading ~ is expanded here.
+  const raw = src.ORCA_MCP_CLIENT_PROFILE?.trim();
+  const profile = raw === "~" || raw?.startsWith("~/") ? join(src.HOME || homedir(), raw.slice(1)) : raw;
   const withProfile = profile ? { ...opts, extraEnv: { ...opts.extraEnv, ORCA_USER_DATA_PATH: profile } } : opts;
   return runJsonCli("orca", opts.bin ?? resolveOrcaBin(src), args, withProfile, unwrapOrca);
 }

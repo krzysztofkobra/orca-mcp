@@ -450,11 +450,13 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       const res = r.result as { messages?: MailMessage[]; timedOut?: boolean } | undefined;
       // A worker's mail comes from its terminal handle with the dispatch in the payload. The payload
       // counts only from the terminal Orca bound to that dispatch, so another worker cannot claim it.
+      // Without a bound terminal (Orca named none) only mail from `dispatch:<id>` can match.
       const dispatchOf = (m: MailMessage) => {
         const p = m.payload as { dispatchId?: unknown } | undefined;
-        const own = m.from?.replace(/^dispatch:/, "");
-        if (typeof p?.dispatchId !== "string") return own;
-        return !fromDispatch || (!!dispatchTerminal && m.from === dispatchTerminal) ? p.dispatchId : own;
+        const claimed = typeof p?.dispatchId === "string" ? p.dispatchId : undefined;
+        if (!fromDispatch) return claimed ?? m.from?.replace(/^dispatch:/, "");
+        if (dispatchTerminal && m.from === dispatchTerminal) return claimed ?? fromDispatch;
+        return m.from?.replace(/^dispatch:/, "");
       };
       const fresh = (res?.messages ?? []).filter((m) => m.id && !seenMail.has(m.id) && WAKE_TYPES.includes(m.type ?? "") && (!fromDispatch || dispatchOf(m) === fromDispatch));
       const m = fresh[0];
@@ -759,12 +761,15 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         let terminal = a.terminal;
         let runId = a.run;
         let dispatchWs: string | undefined;
+        // The terminal Orca bound to the dispatch: the only sender whose mail may speak for it.
+        let boundTerminal: string | undefined;
         if (a.dispatch) {
           if (!orch) return fail("dispatch ids need Orca orchestration, which is disabled here: pass the agent's terminal");
           const shown = await run(["orchestration", "worker-show", `--dispatch=${a.dispatch}`]);
           if (!shown.ok) return fail(shown.error);
           runId ??= pick(shown.result, ["runId"]);
-          terminal ??= pick(shown.result, ["terminal"]);
+          boundTerminal = pick(shown.result, ["terminal"]);
+          terminal ??= boundTerminal;
           dispatchWs = pick(shown.result, ["workspace"]);
         }
         if (!a.run && !a.dispatch && !a.terminal && !a.worktree) runId = runs.at(-1);
@@ -805,7 +810,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const hookOnly = (row: PsRow, pane?: PsAgent): HookMode => (inScope(row, pane) ? "all" : false);
 
         const ac = new AbortController();
-        const mailP = waitMail(runId, left(), a.dispatch, ac.signal, a.dispatch ? terminal : undefined).then((o) => ({ src: "mail" as const, o }));
+        const mailP = waitMail(runId, left(), a.dispatch, ac.signal, boundTerminal).then((o) => ({ src: "mail" as const, o }));
         const hookP = waitAny(raced, label, left(), undefined, ac.signal).then((o) => ({ src: "hook" as const, o }));
         const fallback = async (failed: OrcaResult & { ok: false }) => {
           ac.abort();

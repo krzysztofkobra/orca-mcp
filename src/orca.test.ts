@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -26,6 +26,15 @@ describe("runOrca", () => {
     expect(plain!.env).not.toContain("ORCA_USER_DATA_PATH");
     expect(profiled!.env).toContain("ORCA_USER_DATA_PATH");
     expect(profiled!.env).not.toContain("ORCA_MCP_CLIENT_PROFILE");
+  });
+
+  it("a leading ~ in ORCA_MCP_CLIENT_PROFILE is the user's home, since MCP client configs pass env verbatim", async () => {
+    const f = fakeOrca({});
+    const bin = join(f.home, "env-orca");
+    writeFileSync(bin, `#!${process.execPath}\nrequire("fs").writeFileSync(${JSON.stringify(join(f.home, "profile.txt"))}, process.env.ORCA_USER_DATA_PATH ?? "");\nprocess.stdout.write(JSON.stringify({ ok: true, result: {} }));\n`);
+    chmodSync(bin, 0o755);
+    await runOrca(["status"], { bin, env: { ...f.env, ORCA_MCP_CLIENT_PROFILE: "~/.orca-coordinator" } });
+    expect(readFileSync(join(f.home, "profile.txt"), "utf8")).toBe(join(f.env.HOME!, ".orca-coordinator"));
   });
 
   it("does not run a shell: metacharacters reach orca as literal argv", async () => {

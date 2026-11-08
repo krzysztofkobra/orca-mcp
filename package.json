@@ -1,6 +1,6 @@
 {
   "name": "@krzysztofkobra/orca-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for Orca: start, watch and steer coding agents running in Orca from any MCP client (Hermes Agent, Claude Code, Codex).",
   "license": "MIT",
   "author": "Krzysztof Kobra",
