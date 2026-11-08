@@ -26,12 +26,14 @@ structured content. Read the state, not the prose: `working`, `waiting`,
   (`orca_status` says `orchestration on`). Without it `orca_worker_start` falls
   back to a plain worktree by itself.
 - `orca_run_create` needs a coordinator identity. That takes an Orca build with
-  `orchestration.external-coordinator.v1`: when `orca_status` says
-  `external coordinator supported`, the server registers as an external
-  coordinator by itself and keeps its key out of your context. Otherwise skip
-  `orca_run_create`: `orca_worker_start` with a `spec` creates its own Run. If a
-  result says orca-mcp runs inside an Orca terminal (`external_from_agent_context`),
-  external mode is unavailable there too.
+  `orchestration.external-coordinator.v1` and a paired environment the user saved
+  and named in `ORCA_MCP_ENVIRONMENT`: then `orca_status` says
+  `external coordinator on (environment <name>)`, and you call `orca_run_create`
+  before `orca_worker_start` (in this mode a worker start makes no Run). Otherwise
+  skip `orca_run_create`: `orca_worker_start` with a `spec` creates its own Run.
+  Never pair or ask for a pairing code yourself; setup is in the README.
+- A result with state `fenced` means a terminal took the Run over: stop waiting on
+  it, tell the user, and create a new Run if the work goes on.
 
 ## Coordinator loop
 
