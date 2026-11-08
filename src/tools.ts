@@ -434,7 +434,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
    * coordinator still gets every message. `failed` when the mailbox cannot be
    * read this way, so the caller can fall back to hook state.
    */
-  const waitMail = async (runId: string, timeoutMs: number, fromDispatch?: string, signal?: AbortSignal): Promise<Outcome | { kind: "failed"; failed: OrcaResult & { ok: false } }> => {
+  const waitMail = async (runId: string, timeoutMs: number, fromDispatch?: string, signal?: AbortSignal, dispatchTerminal?: string): Promise<Outcome | { kind: "failed"; failed: OrcaResult & { ok: false } }> => {
     const start = now();
     const deadline = start + timeoutMs;
     let waitArgs = true;
@@ -448,10 +448,13 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       if (!r.ok && r.code === FENCED) return { kind: "event", commit: () => {}, result: fenced(runId, r) };
       if (!r.ok) return { kind: "failed", failed: r };
       const res = r.result as { messages?: MailMessage[]; timedOut?: boolean } | undefined;
-      // A worker's mail comes from its terminal handle; the dispatch it reports on is in the payload.
+      // A worker's mail comes from its terminal handle with the dispatch in the payload. The payload
+      // counts only from the terminal Orca bound to that dispatch, so another worker cannot claim it.
       const dispatchOf = (m: MailMessage) => {
         const p = m.payload as { dispatchId?: unknown } | undefined;
-        return typeof p?.dispatchId === "string" ? p.dispatchId : m.from?.replace(/^dispatch:/, "");
+        const own = m.from?.replace(/^dispatch:/, "");
+        if (typeof p?.dispatchId !== "string") return own;
+        return !fromDispatch || (!!dispatchTerminal && m.from === dispatchTerminal) ? p.dispatchId : own;
       };
       const fresh = (res?.messages ?? []).filter((m) => m.id && !seenMail.has(m.id) && WAKE_TYPES.includes(m.type ?? "") && (!fromDispatch || dispatchOf(m) === fromDispatch));
       const m = fresh[0];
@@ -802,7 +805,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const hookOnly = (row: PsRow, pane?: PsAgent): HookMode => (inScope(row, pane) ? "all" : false);
 
         const ac = new AbortController();
-        const mailP = waitMail(runId, left(), a.dispatch, ac.signal).then((o) => ({ src: "mail" as const, o }));
+        const mailP = waitMail(runId, left(), a.dispatch, ac.signal, a.dispatch ? terminal : undefined).then((o) => ({ src: "mail" as const, o }));
         const hookP = waitAny(raced, label, left(), undefined, ac.signal).then((o) => ({ src: "hook" as const, o }));
         const fallback = async (failed: OrcaResult & { ok: false }) => {
           ac.abort();
