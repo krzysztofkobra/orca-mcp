@@ -100,6 +100,7 @@ coordinator loop; copy it into your client's skills folder (for Claude Code:
 | `ORCA_BIN` | the CLI inside the installed Orca app, else `orca` on PATH | Path of the `orca` CLI. Looked up at `/Applications/Orca.app/Contents/Resources/bin/orca` (macOS), `~/.local/bin/orca` (Linux), `%LOCALAPPDATA%\Programs\Orca\resources\bin\orca.exe` (Windows). |
 | `ORCA_MCP_ROOTS` | `~/dev` | Directories repos and worktrees must lie in, separated by `:` (`;` on Windows). Paths are resolved through symlinks and `..` before the check. |
 | `ORCA_MCP_CLIENT` | the MCP client's name plus a random per-process suffix | The owner tag written into worktrees this server starts (`orca-mcp:<tag>`). Without it each server process has its own tag, so "mine" does not survive a restart of the server; set a stable value (for example one per project or daemon) to find your workers again after a restart. |
+| `ORCA_MCP_BRIDGE` | on | `0` does not open the status socket for the companion plugin. |
 | `ORCA_MCP_TMP_PREFIX` | unset | Also allow scratch directories directly under the per-user temp dir whose name starts with this prefix. The directory must exist, be owned by you and be writable by nobody else. |
 
 The orca CLI runs with an argv array (never a shell), a minimal environment
@@ -125,6 +126,17 @@ are refused before anything runs.
 | `orca_terminal_send`, `orca_terminal_wait` | Low-level terminal input and waits. |
 | `orca_worker_stop`, `orca_worktree_rm` | Stop an agent; remove a worktree (destructive). |
 | `orca_search` | Search past agent conversations. |
+
+## Push instead of polling (optional plugin)
+
+`plugin/` is a companion Orca plugin (`trusted-worker`, asks for `agent:read` and
+`workspace:read`). It forwards Orca's `agent.status.changed`, `workspace.created` and
+`workspace.removed` events to every orca-mcp server of your user over a private local socket
+(`<tmpdir>/orca-mcp-<uid>/<pid>.sock`, dir 0700, socket 0600). While it is connected, `orca_wait`
+wakes on those events instead of reading `orca worktree ps` every 5 s, and `orca_agent_status`
+says `via: "push"`. Without the plugin everything works by polling. Set `ORCA_MCP_BRIDGE=0` to
+not open the socket at all. Loading the plugin is your call: Orca shows what it may do and asks
+for approval (`orca plugin dev watch ./plugin`, see `plugin/README.md`).
 
 ## External coordinators
 
