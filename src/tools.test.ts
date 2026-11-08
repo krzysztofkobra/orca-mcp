@@ -329,10 +329,11 @@ describe("orca_wait", () => {
     const o = scripted({ "orchestration check": [done("m1", "disp_1"), both, both] }, { orchestration: true });
     const r = await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
     expect(r).toMatchObject({ state: "done", summary: "Worker disp_1 done: Task disp_1 done", data: { via: "mail", runId: "run_1", event: { type: "worker_done", messageId: "m1", dispatchId: "disp_1" } } });
-    expect(o.calls[0]).toEqual(["orchestration", "check", "--run=run_1", "--peek", "--types=worker_done,escalation", "--wait", "--timeout-ms=300000"]);
+    const checks = () => o.calls.filter((c) => c[1] === "check");
+    expect(checks()[0]).toEqual(["orchestration", "check", "--run=run_1", "--peek", "--types=worker_done,escalation", "--wait", "--timeout-ms=300000"]);
     const next = await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
     expect(next).toMatchObject({ state: "blocked", summary: "Worker disp_2 escalated: Need a decision", data: { event: { messageId: "m2" } } });
-    expect(o.calls.every((c) => c.includes("--peek"))).toBe(true);
+    expect(checks().every((c) => c.includes("--peek"))).toBe(true);
   });
 
   it("a run whose unread mail was all returned already polls instead of spinning, until the timeout", async () => {
@@ -341,9 +342,10 @@ describe("orca_wait", () => {
     await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
     const r = await o.call("orca_wait", { run: "run_1", timeoutMs: 20_000 });
     expect(r).toMatchObject({ state: "working", data: { via: "mail" } });
-    // First call of the second wait used --wait; the following polls do not (they would return at once anyway).
-    expect(o.calls.length).toBeLessThan(10);
-    expect(o.calls.at(-1)).not.toContain("--wait");
+    // The second wait's first check used --wait; the following polls do not (they would return at once anyway).
+    const checks = o.calls.filter((c) => c[1] === "check");
+    expect(checks.length).toBeLessThan(10);
+    expect(checks.at(-1)).not.toContain("--wait");
   });
 
   it("a dispatch waits on its run's mail from that dispatch; an unreadable mailbox falls back to the worker's terminal", async () => {
@@ -352,14 +354,87 @@ describe("orca_wait", () => {
         "orchestration worker-show": [{ ok: true, result: { dispatchId: "disp_1", runId: "run_1", terminal: "term_1", state: "ready" } }],
         "orchestration check": [{ ok: false, error: "orca error: not the coordinator", code: "stable_pane_required" }],
         "terminal show": [shown],
+        "terminal list": [terms],
         "worktree ps": [pane("done", 1_000_000, { lastAssistantMessage: "Shipped." })],
       },
       { orchestration: true },
     );
     const r = await o.call("orca_wait", { dispatch: "disp_1", timeoutMs: 300_000 });
-    expect(r).toMatchObject({ state: "done", data: { via: "hook" } });
+    expect(r).toMatchObject({ state: "done", data: { via: "hook", worker: { terminal: "term_1" } } });
     expect(r.text).toContain("Run mailbox unreadable (stable_pane_required); waited on hook state instead.");
-    expect(o.kinds()).toEqual(["orchestration worker-show", "orchestration check", "terminal show", "worktree ps"]);
+    expect(o.kinds()[0]).toBe("orchestration worker-show");
+    expect(o.kinds()).toContain("orchestration check");
+  });
+
+  it("a dispatch with no terminal or worktree and an unreadable mailbox is unknown, never another worker's event", async () => {
+    const o = scripted(
+      {
+        "orchestration worker-show": [{ ok: true, result: { dispatchId: "disp_1", runId: "run_1", state: "ready" } }],
+        "orchestration check": [{ ok: false, error: "orca error: not the coordinator", code: "stable_pane_required" }],
+        "terminal list": [terms],
+        // This client's other worker is done; it must not be reported as disp_1.
+        "worktree ps": [pane("done", 1_000_000, { lastAssistantMessage: "Other work." })],
+      },
+      { orchestration: true },
+    );
+    const r = await o.call("orca_wait", { dispatch: "disp_1", timeoutMs: 300_000 });
+    expect(r).toMatchObject({ isError: false, state: "unknown", data: { dispatchId: "disp_1" } });
+    expect(r.summary).toMatch(/^Cannot wait on dispatch disp_1: its Run mailbox is unreadable \(stable_pane_required\)/);
+    expect(r.text).not.toContain("Other work.");
+  });
+
+  it("a dispatch with only a worktree is scoped to that worktree when its mailbox is unreadable", async () => {
+    const fleet: OrcaResult = { ok: true, result: { worktrees: [
+      { path: "/w/x", worktreeId: "r::/w/x", comment: "orca-mcp:tester", agents: [{ paneKey: "tab:leaf", agentType: "claude", state: "done", stateStartedAt: 1_000_000, lastAssistantMessage: "Other work." }] },
+      { path: "/w/y", worktreeId: "r::/w/y", comment: "orca-mcp:tester", agents: [{ paneKey: "t2:l2", agentType: "codex", state: "waiting", stateStartedAt: 1_000_000, toolName: "Bash" }] },
+    ] } };
+    const o = scripted(
+      {
+        "orchestration worker-show": [{ ok: true, result: { dispatchId: "disp_2", runId: "run_1", workspace: "r::/w/y" } }],
+        "orchestration check": [{ ok: false, error: "orca error: not the coordinator", code: "stable_pane_required" }],
+        "terminal list": [terms],
+        "worktree ps": [fleet],
+      },
+      { orchestration: true },
+    );
+    const r = await o.call("orca_wait", { dispatch: "disp_2", timeoutMs: 300_000 });
+    expect(r).toMatchObject({ state: "waiting", data: { via: "hook", worker: { worktree: "/w/y", terminal: "term_2" } } });
+    expect(r.text).not.toContain("Other work.");
+  });
+
+  it("inside a Run, a worker parked on a prompt returns waiting before the timeout though it never mails", async () => {
+    const o = scripted(
+      {
+        "orchestration worker-list": [{ ok: true, result: { workers: [{ dispatchId: "disp_1", workspace: "r::/w/x" }] } }],
+        "orchestration check": [{ ok: true, result: { messages: [], timedOut: true } }],
+        "terminal list": [terms],
+        "worktree ps": [pane("working"), pane("waiting", 1_005_000, { toolName: "Bash", toolInput: "git push" })],
+      },
+      { orchestration: true },
+    );
+    const r = await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
+    expect(r).toMatchObject({ isError: false, state: "waiting", data: { via: "hook", worker: { worktree: "/w/x", blockedOn: "Bash: git push" } } });
+  });
+
+  it("inside a Run, a run worker's finish comes from its mail only, while a plain owned worker's finish comes from hook state", async () => {
+    const twoRows = (runState: string, plainState: string): OrcaResult => ({ ok: true, result: { worktrees: [
+      { path: "/w/x", worktreeId: "r::/w/x", comment: "orca-mcp:tester", agents: [{ paneKey: "tab:leaf", state: runState, stateStartedAt: 1_000_000, lastAssistantMessage: "Run worker finished." }] },
+      { path: "/w/p", worktreeId: "r::/w/p", comment: "orca-mcp:tester", agents: [{ paneKey: "t2:l2", state: plainState, stateStartedAt: 1_000_000, lastAssistantMessage: "Plain worker finished." }] },
+    ] } });
+    const o = scripted(
+      {
+        "orchestration worker-list": [{ ok: true, result: { workers: [{ dispatchId: "disp_1", workspace: "r::/w/x" }] } }],
+        "orchestration check": [{ ok: true, result: { messages: [], timedOut: true } }],
+        "terminal list": [terms],
+        "worktree ps": [twoRows("done", "done")],
+      },
+      { orchestration: true },
+    );
+    const r = await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
+    expect(r).toMatchObject({ state: "done", summary: expect.stringContaining("Plain worker finished.") });
+    // The run worker's hook done is never reported; with no mail the wait times out.
+    const again = await o.call("orca_wait", { run: "run_1", timeoutMs: 300_000 });
+    expect(again).toMatchObject({ state: "working", data: { via: "mail" } });
   });
 });
 

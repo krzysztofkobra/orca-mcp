@@ -173,6 +173,10 @@ const oneLine = (s: string, max: number) => {
 };
 
 type MailMessage = { id?: string; type?: string; from?: string; subject?: string; body?: string; payload?: unknown };
+/** A wait's result: an event, committed (marked as reported) only when it is the one returned, or nothing new in time. */
+type Outcome = { kind: "event"; result: ToolResult; commit: () => void } | { kind: "none"; result: ToolResult };
+/** Which events of a pane a hook wait reports: all, only stops for a human (its finish comes as Run mail), or none. */
+type HookMode = "all" | "attention" | false;
 
 export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const env = deps.env ?? process.env;
@@ -299,27 +303,39 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     return reply("idle", "Terminal idle by the TUI signal; the agent reports no hook state, so it may not be done.", { details: details(`Read its output before you trust it. ${compact(r.result, 2000)}`), data: { via: "tui-idle", result: r.result } });
   };
 
-  /** The first worker among several that finishes or stops for a human; each event is returned once per process. */
-  const waitAny = async (match: (row: PsRow) => boolean, label: string, timeoutMs: number, note?: string): Promise<ToolResult> => {
+  /** Sleep that ends early when the wait it belongs to lost a race. */
+  const pause = (ms: number, signal?: AbortSignal) =>
+    signal ? Promise.race([sleep(ms), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]) : sleep(ms);
+
+  /**
+   * The first worker among several that finishes or stops for a human. `mode` says per pane
+   * which events count: all, only stops for a human (its finish comes as Run mail), or none.
+   * The event is committed (marked reported) only when it is the one returned.
+   */
+  const waitAny = async (mode: (row: PsRow, pane?: PsAgent) => HookMode, label: string, timeoutMs: number, note?: string, signal?: AbortSignal): Promise<Outcome> => {
     const start = now();
     const deadline = start + timeoutMs;
     const quiet = new Map<string, string>();
     let psFails = 0;
     let watched = 0;
     const details = (s: string) => (note ? `${note}\n${s}` : s);
+    const none = (result: ToolResult): Outcome => ({ kind: "none", result });
     for (;;) {
-      const ps = await run(["worktree", "ps"], 10_000);
-      if (!ps.ok && ++psFails >= PS_FAILS) return fail(`Orca is not answering (worktree ps failed ${psFails} times): ${ps.error}`);
+      if (signal?.aborted) return none(reply("cancelled", "Wait cancelled."));
+      const ps = await run(["worktree", "ps"], 10_000, signal);
+      if (signal?.aborted) return none(reply("cancelled", "Wait cancelled."));
+      if (!ps.ok && ++psFails >= PS_FAILS) return none(fail(`Orca is not answering (worktree ps failed ${psFails} times): ${ps.error}`));
       if (ps.ok) {
         psFails = 0;
-        const rows = psRows(ps.result).filter(match);
-        watched = rows.reduce((n, r) => n + (r.agents?.length ?? 0), 0);
-        if (!rows.length) return reply("idle", `No ${label} to wait on.`, { details: note, data: { via: "hook", workers: [] } });
+        const rows = psRows(ps.result).filter((r) => (r.agents?.length ? r.agents.some((p) => mode(r, p)) : mode(r)));
+        watched = rows.reduce((n, r) => n + (r.agents ?? []).filter((p) => mode(r, p)).length, 0);
+        if (!rows.length) return none(reply("idle", `No ${label} to wait on.`, { details: note, data: { via: "hook", workers: [] } }));
         // A young worktree whose agent has not reported yet (booting) is pending; an old one without agents is a closed worker.
         let pending = rows.filter((r) => !r.agents?.length && now() - (r.createdAt ?? r.lastActivityAt ?? 0) < HOOKLESS_MS).length;
         for (const row of rows) {
           for (const pane of row.agents ?? []) {
-            if (!pane.paneKey) continue;
+            const m = mode(row, pane);
+            if (!pane.paneKey || !m) continue;
             const state = normalizeState(pane.state);
             const stamp = String(pane.stateStartedAt ?? "");
             const msg = typeof pane.lastAssistantMessage === "string" ? pane.lastAssistantMessage.trim() : "";
@@ -328,61 +344,76 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
             else quiet.delete(pane.paneKey);
             const event = `${state}:${stamp}`;
             if (reported.get(pane.paneKey) === event) continue;
+            if (state === "done" && m === "attention") continue;
             pending++;
             if ((state === "done" && (msg || seenQuiet)) || needsAttention(state)) {
-              reported.set(pane.paneKey, event);
-              const w = workerStatus(row, pane, { terminal: await terminalOfPane(pane.paneKey), includeMessage: true, now: now() });
-              return reply(state, w.summary, {
-                details: details(state === "done" ? `${msg ? `Its last message: ${msg.slice(0, 4000)}\n` : ""}Read the full output with orca_terminal_read.` : "Read its screen (orca_terminal_read, screen true), then answer it or bring the question back."),
-                data: { via: "hook", worker: w },
-              });
+              const key = pane.paneKey;
+              const w = workerStatus(row, pane, { terminal: await terminalOfPane(key), includeMessage: true, now: now() });
+              return {
+                kind: "event",
+                commit: () => reported.set(key, event),
+                result: reply(state, w.summary, {
+                  details: details(state === "done" ? `${msg ? `Its last message: ${msg.slice(0, 4000)}\n` : ""}Read the full output with orca_terminal_read.` : "Read its screen (orca_terminal_read, screen true), then answer it or bring the question back."),
+                  data: { via: "hook", worker: w },
+                }),
+              };
             }
           }
         }
         // Every agent already reported (done, or waiting on a human): nothing new can come without a send.
-        if (!pending) return reply("idle", `Nothing new in the ${label}: all ${watched} agent${watched === 1 ? "" : "s"} already reported.`, { details: details("Send follow-ups (orca_send) or start workers, then wait again."), data: { via: "hook" } });
+        if (!pending) return none(reply("idle", `Nothing new in the ${label}: all ${watched} agent${watched === 1 ? "" : "s"} already reported.`, { details: details("Send follow-ups (orca_send) or start workers, then wait again."), data: { via: "hook" } }));
       }
-      if (now() - start >= HOOKLESS_MS && watched === 0 && ps.ok) return reply("idle", `No live agent in the ${label} after ${Math.round((now() - start) / 1000)} s.`, { details: note, data: { via: "hook" } });
-      if (now() >= deadline) return reply("working", `Still running after ${Math.round((now() - start) / 1000)} s (${watched} agent${watched === 1 ? "" : "s"} in the ${label}).`, { details: details("Wait again with orca_wait."), data: { via: "hook" } });
-      await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+      if (now() - start >= HOOKLESS_MS && watched === 0 && ps.ok) return none(reply("idle", `No live agent in the ${label} after ${Math.round((now() - start) / 1000)} s.`, { details: note, data: { via: "hook" } }));
+      if (now() >= deadline) return none(reply("working", `Still running after ${Math.round((now() - start) / 1000)} s (${watched} agent${watched === 1 ? "" : "s"} in the ${label}).`, { details: details("Wait again with orca_wait."), data: { via: "hook" } }));
+      await pause(Math.min(pollMs, Math.max(0, deadline - now())), signal);
     }
   };
 
   /**
    * Waits on a Run's mailbox without taking mail (`--peek`), so the Run's own
-   * coordinator still gets every message. Returns null with the failure when the
-   * mailbox cannot be read this way, so the caller can fall back to hook state.
+   * coordinator still gets every message. `failed` when the mailbox cannot be
+   * read this way, so the caller can fall back to hook state.
    */
-  const waitMail = async (runId: string, timeoutMs: number, fromDispatch?: string): Promise<{ event: ToolResult } | { failed: OrcaResult & { ok: false } }> => {
+  const waitMail = async (runId: string, timeoutMs: number, fromDispatch?: string, signal?: AbortSignal): Promise<Outcome | { kind: "failed"; failed: OrcaResult & { ok: false } }> => {
     const start = now();
     const deadline = start + timeoutMs;
     const from = await coord.fromArgs();
     let waitArgs = true;
     for (;;) {
+      if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
       const rest = Math.max(1000, deadline - now());
       const args = ["orchestration", "check", `--run=${runId}`, "--peek", `--types=${WAKE_TYPES.join(",")}`, ...(waitArgs ? ["--wait", `--timeout-ms=${rest}`] : []), ...from];
-      const r = await run(args, waitArgs ? rest + 15_000 : READ_MS);
-      if (!r.ok) return { failed: r };
+      const r = await run(args, waitArgs ? rest + 15_000 : READ_MS, signal);
+      if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
+      if (!r.ok) return { kind: "failed", failed: r };
       const res = r.result as { messages?: MailMessage[]; timedOut?: boolean } | undefined;
       const fresh = (res?.messages ?? []).filter((m) => m.id && !seenMail.has(m.id) && WAKE_TYPES.includes(m.type ?? "") && (!fromDispatch || m.from === fromDispatch || m.from === `dispatch:${fromDispatch}`));
       const m = fresh[0];
       if (m) {
-        seenMail.add(m.id!);
         const payload = m.payload as { outcome?: unknown; status?: unknown } | undefined;
         const failed = m.type === "worker_done" && (payload?.outcome === "failed" || payload?.status === "failed");
         const state = m.type === "worker_done" ? (failed ? "failed" : "done") : "blocked";
         const dispatchId = m.from?.replace(/^dispatch:/, "");
         const about = oneLine(m.subject || m.body || "", 160);
-        return { event: reply(state, `Worker ${dispatchId ?? "?"} ${m.type === "worker_done" ? (failed ? "failed" : "done") : "escalated"}${about ? `: ${about}` : ""}`, {
-          details: `${m.body ? `${m.body.slice(0, 4000)}\n` : ""}${m.type === "escalation" ? "Answer with orca_send (to dispatch:<id>), or bring it back to the user." : "Read its output with orca_worker_read."}${fresh.length > 1 ? `\n${fresh.length - 1} more event(s) waiting: call orca_wait again.` : ""}`,
-          data: { via: "mail", runId, event: { type: m.type, messageId: m.id, dispatchId, subject: m.subject, body: m.body?.slice(0, 4000), payload: m.payload } },
-        }) };
+        return {
+          kind: "event",
+          commit: () => seenMail.add(m.id!),
+          result: reply(state, `Worker ${dispatchId ?? "?"} ${m.type === "worker_done" ? (failed ? "failed" : "done") : "escalated"}${about ? `: ${about}` : ""}`, {
+            details: `${m.body ? `${m.body.slice(0, 4000)}\n` : ""}${m.type === "escalation" ? "Answer with orca_send (to dispatch:<id>), or bring it back to the user." : "Read its output with orca_worker_read."}${fresh.length > 1 ? `\n${fresh.length - 1} more event(s) waiting: call orca_wait again.` : ""}`,
+            data: { via: "mail", runId, event: { type: m.type, messageId: m.id, dispatchId, subject: m.subject, body: m.body?.slice(0, 4000), payload: m.payload } },
+          }),
+        };
       }
-      if (now() >= deadline || res?.timedOut) return { event: reply("working", `No worker_done or escalation in run ${runId} after ${Math.round((now() - start) / 1000)} s.`, { details: "Wait again with orca_wait.", data: { via: "mail", runId } }) };
+      if (now() >= deadline || res?.timedOut) return { kind: "none", result: reply("working", `No worker_done or escalation in run ${runId} after ${Math.round((now() - start) / 1000)} s.`, { details: "Wait again with orca_wait.", data: { via: "mail", runId } }) };
       // Unread mail this process already returned makes a peek wait return at once: poll until it is read or new mail comes.
       waitArgs = !res?.messages?.length;
-      await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+      await pause(Math.min(pollMs, Math.max(0, deadline - now())), signal);
     }
+  };
+
+  const settle = (o: Outcome) => {
+    if (o.kind === "event") o.commit();
+    return o.result;
   };
 
   /** Starts an agent in a fresh worktree the stable way (no orchestration). */
@@ -631,38 +662,83 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     {
       name: "orca_wait",
       description:
-        "Block server-side until a worker finishes or needs a human, then return one structured event (state done, failed, waiting or blocked, plus the worker and its last message). With a run (or a dispatch, or a run this server created) it waits on the Run's worker_done and escalation mail without taking it; otherwise on Orca's hook state for one terminal, one worktree, or every worker this client started. Each event is returned once, so calling orca_wait in a loop walks through them. On state working the timeout passed: wait again.",
+        "Block server-side until a worker finishes or needs a human, then return one structured event (state done, failed, waiting or blocked, plus the worker and its last message). With a run (or a dispatch, or a run this server created) it waits on the Run's worker_done and escalation mail without taking it and, at the same time, on Orca's hook state (a worker parked on a prompt never mails); otherwise on hook state alone for one terminal, one worktree, or every worker this client started. Each event is returned once, so calling orca_wait in a loop walks through them. On state working the timeout passed: wait again.",
       shape: { run: handle.optional(), dispatch: handle.optional(), terminal: handle.optional(), worktree: absPath.optional(), timeoutMs: z.number().int().min(1000).max(MAX_WAIT_MS).default(300_000) },
       handler: async (a: { run?: string | undefined; dispatch?: string | undefined; terminal?: string | undefined; worktree?: string | undefined; timeoutMs: number }) => {
         const started = now();
+        const left = () => Math.max(1000, a.timeoutMs - (now() - started));
         const orch = await orchestration();
         let terminal = a.terminal;
         let runId = a.run;
+        let dispatchWs: string | undefined;
         if (a.dispatch) {
           if (!orch) return fail("dispatch ids need Orca orchestration, which is disabled here: pass the agent's terminal");
           const shown = await run(["orchestration", "worker-show", `--dispatch=${a.dispatch}`]);
           if (!shown.ok) return fail(shown.error);
           runId ??= pick(shown.result, ["runId"]);
           terminal ??= pick(shown.result, ["terminal"]);
+          dispatchWs = pick(shown.result, ["workspace"]);
         }
-        const targetless = !a.run && !a.dispatch && !a.terminal && !a.worktree;
-        if (targetless) runId = runs.at(-1);
-        let note: string | undefined;
-        if (runId && orch) {
-          const m = await waitMail(runId, a.timeoutMs, a.dispatch);
-          if ("event" in m) return m.event;
-          if (a.run && !terminal && !a.worktree) return fail(m.failed.error, m.failed.code ? { code: m.failed.code } : undefined);
-          note = `Run mailbox unreadable (${m.failed.code ?? m.failed.error}); waited on hook state instead.`;
-        }
-        const rest = Math.max(1000, a.timeoutMs - (now() - started));
-        if (terminal) return waitTerminal(terminal, rest, note);
-        if (a.worktree) {
-          const c = checkPath(a.worktree, env);
-          const base = "error" in c ? a.worktree : c.path;
-          return waitAny((row) => !!row.path && underPath(row.path, base), `worktree ${base}`, rest, note);
-        }
+        if (!a.run && !a.dispatch && !a.terminal && !a.worktree) runId = runs.at(-1);
         const me = client();
-        return waitAny((row) => ownerOf(row.comment) === me, `workers of ${me}`, rest, note);
+        const base = a.worktree ? (((c) => ("error" in c ? a.worktree! : c.path))(checkPath(a.worktree, env))) : undefined;
+        const wsPath = worktreePathOfId(dispatchWs);
+        const label = a.dispatch ? `dispatch ${a.dispatch}` : terminal ? `terminal ${terminal}` : base ? `worktree ${base}` : runId ? `workers of ${me} and run ${runId}` : `workers of ${me}`;
+        const unknownDispatch = (why: string) =>
+          reply("unknown", `Cannot wait on dispatch ${a.dispatch}: ${why}, and Orca names no terminal or worktree for it.`, { details: "Look at it with orca_agent_status (dispatch).", data: { dispatchId: a.dispatch } });
+
+        if (!runId || !orch) {
+          if (terminal) return waitTerminal(terminal, left());
+          if (a.dispatch && !dispatchWs) return unknownDispatch("it belongs to no Run this server can read");
+          if (a.dispatch) return settle(await waitAny((row) => (row.worktreeId === dispatchWs || (!!wsPath && row.path === wsPath) ? "all" : false), label, left()));
+          if (base) return settle(await waitAny((row) => (row.path && underPath(row.path, base) ? "all" : false), label, left()));
+          return settle(await waitAny((row) => (ownerOf(row.comment) === me ? "all" : false), label, left()));
+        }
+
+        // Mail and hook state at once: a worker parked on a prompt, or one started without orchestration, never mails.
+        let paneKey: string | undefined;
+        if (terminal) {
+          const t = await run(["terminal", "show", `--terminal=${terminal}`]);
+          const r = t.ok ? (t.result as { terminal?: { tabId?: string; leafId?: string }; tabId?: string; leafId?: string }) : undefined;
+          const tab = r?.terminal?.tabId ?? r?.tabId;
+          const leaf = r?.terminal?.leafId ?? r?.leafId;
+          if (tab && leaf) paneKey = `${tab}:${leaf}`;
+        }
+        const wl = await run(["orchestration", "worker-list", `--run=${runId}`, "--limit=100"]);
+        const runWs = new Set(wl.ok ? workerRows(wl.result).flatMap((w) => (w.workspace ? [w.workspace] : [])) : []);
+        const inScope = (row: PsRow, pane?: PsAgent): boolean => {
+          if (a.dispatch) return (!!paneKey && pane?.paneKey === paneKey) || (!!dispatchWs && (row.worktreeId === dispatchWs || (!!wsPath && row.path === wsPath)));
+          if (terminal) return !!paneKey && pane?.paneKey === paneKey;
+          if (base) return !!row.path && underPath(row.path, base);
+          return ownerOf(row.comment) === me || runWs.has(row.worktreeId ?? "");
+        };
+        // Workers of the Run report their finish as mail; hook state adds only their stops for a human.
+        const raced = (row: PsRow, pane?: PsAgent): HookMode => (!inScope(row, pane) ? false : a.dispatch || runWs.has(row.worktreeId ?? "") ? "attention" : "all");
+        const hookOnly = (row: PsRow, pane?: PsAgent): HookMode => (inScope(row, pane) ? "all" : false);
+
+        const ac = new AbortController();
+        const mailP = waitMail(runId, left(), a.dispatch, ac.signal).then((o) => ({ src: "mail" as const, o }));
+        const hookP = waitAny(raced, label, left(), undefined, ac.signal).then((o) => ({ src: "hook" as const, o }));
+        const fallback = async (failed: OrcaResult & { ok: false }) => {
+          ac.abort();
+          const note = `Run mailbox unreadable (${failed.code ?? failed.error}); waited on hook state instead.`;
+          if (a.dispatch && !paneKey && !dispatchWs) return unknownDispatch(`its Run mailbox is unreadable (${failed.code ?? failed.error})`);
+          return settle(await waitAny(hookOnly, label, left(), note));
+        };
+        const first = await Promise.race([mailP, hookP]);
+        if (first.o.kind === "event") {
+          ac.abort();
+          return settle(first.o);
+        }
+        if (first.o.kind === "failed") return fallback(first.o.failed);
+        const second = first.src === "mail" ? await hookP : await mailP;
+        if (second.o.kind === "event") {
+          ac.abort();
+          return settle(second.o);
+        }
+        if (second.o.kind === "failed") return fallback(second.o.failed);
+        // Neither source had anything: the mail wait ran the full time.
+        return first.src === "mail" ? first.o.result : second.o.result;
       },
     },
     {
