@@ -22,6 +22,7 @@ import {
   type WorkerStatus,
 } from "./agent-state.js";
 import { capabilitiesOf, capabilityProbe, coordinatorAdapter, EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe, type CoordinatorAdapter } from "./capabilities.js";
+import type { PushSource } from "./bridge.js";
 import { checkPath } from "./paths.js";
 import { runOrca, type OrcaResult, type OrcaRunner } from "./orca.js";
 
@@ -110,6 +111,12 @@ export interface ToolDeps {
    * accounting or policy around these tools.
    */
   onToolResult?: (name: string, args: unknown, result: ToolResult) => ToolResult | void | Promise<ToolResult | void>;
+  /**
+   * Agent states pushed by the companion Orca plugin. While a plugin is connected, waits wake
+   * on its events instead of polling every `pollMs`, and every `worktree ps` read is overlaid
+   * with the newer pushed states.
+   */
+  bridge?: PushSource;
   /** Clock and sleep of the waits (tests). */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -151,6 +158,8 @@ const HOOKLESS_MS = 120_000;
 /** Consecutive failed `worktree ps` reads before a wait says Orca is unreachable. */
 const PS_FAILS = 3;
 const WAKE_TYPES = ["worker_done", "escalation"];
+/** With a plugin pushing, `worktree ps` is still read this often in case an event was lost. */
+const PUSH_SAFETY_MS = 30_000;
 
 function compact(v: unknown, max = 8000): string {
   const s = JSON.stringify(v);
@@ -234,6 +243,20 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     return direct;
   };
 
+  /** `worktree ps`, overlaid with pushed agent states while the plugin is connected. */
+  const readPs = async (signal?: AbortSignal): Promise<OrcaResult & { pushed?: boolean }> => {
+    const ps = await run(["worktree", "ps"], 10_000, signal);
+    if (!ps.ok || !deps.bridge?.connected()) return ps;
+    return { ok: true, result: { ...(ps.result as object), worktrees: deps.bridge.overlay(psRows(ps.result)) }, pushed: true };
+  };
+
+  /** Until the next read of a hook-state wait: the plugin's next event when it is connected, else the poll interval. */
+  const nextRead = async (deadline: number, signal?: AbortSignal) => {
+    const ms = Math.max(0, deadline - now());
+    if (deps.bridge?.connected()) await deps.bridge.changed(Math.min(PUSH_SAFETY_MS, ms), signal);
+    else await pause(Math.min(pollMs, ms), signal);
+  };
+
   const terminalOfPane = async (paneKey: string | undefined): Promise<string | undefined> => {
     if (!paneKey) return undefined;
     const t = await run(["terminal", "list"]);
@@ -259,7 +282,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     if (tab && leaf) {
       const key = `${tab}:${leaf}`;
       for (;;) {
-        const ps = await run(["worktree", "ps"], 10_000);
+        const ps = await readPs();
         if (!ps.ok && ++psFails >= PS_FAILS) return fail(`Orca is not answering (worktree ps failed ${psFails} times): ${ps.error}`);
         if (ps.ok) psFails = 0;
         let hit: { row: PsRow; pane: PsAgent } | undefined;
@@ -293,7 +316,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
           const tool = typeof last?.pane.toolName === "string" ? `, last tool ${last.pane.toolName}` : "";
           return reply("working", `Still running after ${Math.round((now() - start) / 1000)} s${tool}.`, { details: details("Wait again with orca_wait."), data: { via: "hook", ...(last ? { worker: workerStatus(last.row, last.pane, { terminal, includeMessage: false, now: now() }) } : {}) } });
         }
-        await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+        await nextRead(deadline);
       }
     }
     // No pane behind the terminal, or its agent reports no hook state: the TUI's own idle signal.
@@ -322,7 +345,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     const none = (result: ToolResult): Outcome => ({ kind: "none", result });
     for (;;) {
       if (signal?.aborted) return none(reply("cancelled", "Wait cancelled."));
-      const ps = await run(["worktree", "ps"], 10_000, signal);
+      const ps = await readPs(signal);
       if (signal?.aborted) return none(reply("cancelled", "Wait cancelled."));
       if (!ps.ok && ++psFails >= PS_FAILS) return none(fail(`Orca is not answering (worktree ps failed ${psFails} times): ${ps.error}`));
       if (ps.ok) {
@@ -365,7 +388,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       }
       if (now() - start >= HOOKLESS_MS && watched === 0 && ps.ok) return none(reply("idle", `No live agent in the ${label} after ${Math.round((now() - start) / 1000)} s.`, { details: note, data: { via: "hook" } }));
       if (now() >= deadline) return none(reply("working", `Still running after ${Math.round((now() - start) / 1000)} s (${watched} agent${watched === 1 ? "" : "s"} in the ${label}).`, { details: details("Wait again with orca_wait."), data: { via: "hook" } }));
-      await pause(Math.min(pollMs, Math.max(0, deadline - now())), signal);
+      await nextRead(deadline, signal);
     }
   };
 
@@ -482,7 +505,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     const scope = a.scope ?? "mine";
     const orch = await orchestration();
     const [ps, terms, workers, shown] = await Promise.all([
-      run(["worktree", "ps"]),
+      readPs(),
       run(["terminal", "list"]),
       orch ? run(["orchestration", "worker-list", "--limit=100"]) : Promise.resolve<OrcaResult>({ ok: true, result: {} }),
       a.dispatch && orch ? run(["orchestration", "worker-show", `--dispatch=${a.dispatch}`]) : Promise.resolve<OrcaResult | undefined>(undefined),
@@ -521,7 +544,8 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     const summary = out.length === 1 ? out[0]!.summary : aggregateSummary(out);
     const details = out.length > 1 ? out.map((w) => `- ${w.summary}${w.terminal ? ` [${w.terminal}]` : ""}${w.dispatchId ? ` [dispatch ${w.dispatchId}]` : ""}`).join("\n") : out[0]?.lastAssistantMessage ? `Last message: ${out[0].lastAssistantMessage}` : undefined;
     const scopeNote = !named && scope === "mine" ? { client: me } : {};
-    return reply(state, summary, { details, data: { workers: out, ...scopeNote, ...(show?.runId ? { runId: show.runId } : {}) } });
+    const pushed = "pushed" in ps && ps.pushed === true;
+    return reply(state, summary, { details, data: { workers: out, via: pushed ? "push" : "poll", ...scopeNote, ...(show?.runId ? { runId: show.runId } : {}) } });
   };
 
   const tools: ToolDef[] = [

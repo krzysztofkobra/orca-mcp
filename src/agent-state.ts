@@ -50,6 +50,9 @@ export type PsAgent = {
   taskTitle?: unknown;
   interrupted?: unknown;
   agentWait?: { reason?: unknown; source?: unknown } | null;
+  updatedAt?: unknown;
+  /** The state came from the plugin's push, newer than the `worktree ps` read. */
+  pushed?: boolean;
 };
 export type PsRow = { worktreeId?: string; path?: string; repo?: string; branch?: string; status?: string; comment?: unknown; displayName?: string; createdAt?: number; lastActivityAt?: number; agents?: PsAgent[] };
 export type TerminalRow = { handle?: string; tabId?: string; leafId?: string; worktreeId?: string; worktreePath?: string };
