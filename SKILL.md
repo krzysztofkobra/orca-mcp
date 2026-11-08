@@ -58,11 +58,11 @@ structured content. Read the state, not the prose: `working`, `waiting`,
   changes.
 - Prefer `orca_send` over typing into a terminal; it reaches orchestration
   workers in any state.
-- `orca_check` without `peek` takes the Run's mail; use `orca_wait`, which never
-  does.
+- Use `orca_wait` for the loop; `orca_check` lists a Run's unread mail (it never
+  takes it) but returns everything at once.
 - Do not start a worker again because a start result looked odd. Look first
-  with `orca_agent_status`: workers are tagged in Orca and found again even
-  after this server restarts.
+  with `orca_agent_status`: workers are tagged in Orca (and with a stable
+  `ORCA_MCP_CLIENT` found again after this server restarts).
 - Keep parallel workers few (three is a sane default) unless the user asks
   for more.
 - Paths must lie inside the allowed roots (`ORCA_MCP_ROOTS`, default `~/dev`).

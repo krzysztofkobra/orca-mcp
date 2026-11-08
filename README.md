@@ -17,10 +17,15 @@ makes three things first-class that are awkward through the CLI alone:
   structured event when a worker finishes or needs a human. With an
   orchestration Run it waits on the Run's `worker_done` and `escalation` mail
   (read with `--peek`, so it never takes mail from the Run's coordinator);
-  otherwise on the state Orca's agent hooks report.
+  at the same time it watches the state Orca's agent hooks report, so a worker
+  parked on a permission prompt (which never mails) wakes it too. Without a
+  Run it waits on hook state alone.
 - **Ownership that survives restarts.** Workers this server starts are tagged
-  `orca-mcp:<client>` in their Orca worktree comment, so after a restart they
-  are found again through `orca worktree ps`.
+  `orca-mcp:<tag>` in their Orca worktree comment (appended to an optional
+  note you pass as `comment`), so with a stable `ORCA_MCP_CLIENT` they are
+  found again through `orca worktree ps` after a restart. The tag lives only in
+  that comment: if someone edits it away in Orca, the worker is no longer
+  "mine" (it still shows with `scope: "all"`).
 
 Every tool result starts with a `<state>: <summary>` line and carries the same
 facts as `structuredContent`.
@@ -32,42 +37,57 @@ facts as `structuredContent`.
 
 ## Install
 
-The package is not on npm yet. Build it from a checkout:
+Not on npm yet, so build it from a checkout:
 
 ```sh
 git clone <this repo> orca-mcp && cd orca-mcp
 pnpm install && pnpm build
 ```
 
-Then point your client at `node /abs/path/to/orca-mcp/dist/server.js`. Once
-published, `npx -y orca-mcp` replaces that command in the lines below.
+The server is then `node /abs/path/to/orca-mcp/dist/server.js`. Register it
+with your client (replace the path):
 
-**Hermes Agent**
+**Hermes Agent** (`--args` must come last)
 
 ```sh
-hermes mcp add orca -- npx -y orca-mcp
+hermes mcp add orca --env ORCA_MCP_ROOTS=$HOME/dev --command node --args /abs/path/to/orca-mcp/dist/server.js
+```
+
+or in `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  orca:
+    command: "node"
+    args: ["/abs/path/to/orca-mcp/dist/server.js"]
+    env:
+      ORCA_MCP_ROOTS: "/Users/me/dev"
 ```
 
 **Claude Code**
 
 ```sh
-claude mcp add orca -e ORCA_MCP_ROOTS="$HOME/dev" -- npx -y orca-mcp
+claude mcp add orca -e ORCA_MCP_ROOTS="$HOME/dev" -- node /abs/path/to/orca-mcp/dist/server.js
 ```
 
 **Codex**
 
 ```sh
-codex mcp add orca -- npx -y orca-mcp
+codex mcp add orca --env ORCA_MCP_ROOTS="$HOME/dev" -- node /abs/path/to/orca-mcp/dist/server.js
 ```
 
 or in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.orca]
-command = "npx"
-args = ["-y", "orca-mcp"]
+command = "node"
+args = ["/abs/path/to/orca-mcp/dist/server.js"]
 env = { ORCA_MCP_ROOTS = "/Users/me/dev" }
 ```
+
+**After publish to npm**, the command becomes `npx -y orca-mcp`, e.g.
+`hermes mcp add orca --command npx --args -y orca-mcp`,
+`claude mcp add orca -- npx -y orca-mcp`, `codex mcp add orca -- npx -y orca-mcp`.
 
 `SKILL.md` is an [Agent Skills](https://agentskills.io) file with the
 coordinator loop; copy it into your client's skills folder (for Claude Code:
@@ -79,7 +99,7 @@ coordinator loop; copy it into your client's skills folder (for Claude Code:
 |---|---|---|
 | `ORCA_BIN` | the CLI inside the installed Orca app, else `orca` on PATH | Path of the `orca` CLI. Looked up at `/Applications/Orca.app/Contents/Resources/bin/orca` (macOS), `~/.local/bin/orca` (Linux), `%LOCALAPPDATA%\Programs\Orca\resources\bin\orca.exe` (Windows). |
 | `ORCA_MCP_ROOTS` | `~/dev` | Directories repos and worktrees must lie in, separated by `:` (`;` on Windows). Paths are resolved through symlinks and `..` before the check. |
-| `ORCA_MCP_CLIENT` | the MCP client's name | The tag written into worktrees this server starts (`orca-mcp:<client>`). Set it per session to keep two sessions of the same client apart. |
+| `ORCA_MCP_CLIENT` | the MCP client's name plus a random per-process suffix | The owner tag written into worktrees this server starts (`orca-mcp:<tag>`). Without it each server process has its own tag, so "mine" does not survive a restart of the server; set a stable value (for example one per project or daemon) to find your workers again after a restart. |
 | `ORCA_MCP_TMP_PREFIX` | unset | Also allow scratch directories directly under the per-user temp dir whose name starts with this prefix. The directory must exist, be owned by you and be writable by nobody else. |
 
 The orca CLI runs with an argv array (never a shell), a minimal environment
@@ -100,7 +120,7 @@ are refused before anything runs.
 | `orca_wait` | Server-side wait for the next worker event (see above). |
 | `orca_run_create`, `orca_task_create` | Orchestration Run and Task. |
 | `orca_send` | Orchestration mail to a worker or Run, or a line typed into its terminal. |
-| `orca_check` | Take a Run's mail, or wait on one terminal. Prefer `orca_wait`. |
+| `orca_check` | List or wait for a Run's unread mail (always read with `--peek`, never taken), or wait on one terminal. Prefer `orca_wait`. |
 | `orca_worker_read`, `orca_terminal_read` | A worker's output, by dispatch or terminal, with cursors. |
 | `orca_terminal_send`, `orca_terminal_wait` | Low-level terminal input and waits. |
 | `orca_worker_stop`, `orca_worktree_rm` | Stop an agent; remove a worktree (destructive). |
