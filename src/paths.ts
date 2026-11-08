@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -13,7 +13,10 @@ export function orcaRoots(env: NodeJS.ProcessEnv = process.env): string[] {
   return roots.filter((r) => isAbsolute(r));
 }
 
-/** `ORCA_MCP_TMP_PREFIX` (e.g. `orca-mcp-`): scratch dirs directly under the temp root with that name prefix are allowed too. */
+/**
+ * `ORCA_MCP_TMP_PREFIX` (e.g. `orca-mcp-`): a scratch dir directly under the per-user
+ * temp root with that name prefix, and everything inside it, is allowed too.
+ */
 const tmpPrefix = (env: NodeJS.ProcessEnv) => env.ORCA_MCP_TMP_PREFIX?.trim() || undefined;
 
 /** realpath of the deepest existing ancestor plus the missing tail, so a symlinked parent is resolved too. */
@@ -37,14 +40,26 @@ export const within = (child: string, parent: string) => {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 };
 
-function isScratchTmp(real: string, prefix: string): boolean {
-  const tmpRoots = new Set(["/tmp", "/private/tmp", tmpdir()].map((t) => realish(t)));
-  for (const t of tmpRoots) {
-    if (!within(real, t) || real === t) continue;
-    const first = relative(t, real).split(sep)[0] ?? "";
-    if (first.startsWith(prefix)) return true;
+/**
+ * Only `os.tmpdir()`, never a literal /tmp: that one is world-writable on shared hosts,
+ * so another local user could pre-create `/tmp/<prefix>x` and have agents work inside it.
+ * The scratch dir itself must exist, be ours and be writable by nobody else.
+ */
+export function isScratchTmp(real: string, prefix: string, stat: typeof lstatSync = lstatSync): boolean {
+  const root = realish(tmpdir());
+  if (!within(real, root) || real === root) return false;
+  const first = relative(root, real).split(sep)[0] ?? "";
+  if (!first.startsWith(prefix)) return false;
+  try {
+    const st = stat(join(root, first));
+    if (!st.isDirectory()) return false;
+    // Windows has no uid and reports synthetic mode bits.
+    if (process.platform === "win32") return true;
+    const uid = process.getuid?.();
+    return (uid === undefined || st.uid === uid) && (st.mode & 0o022) === 0;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 /**

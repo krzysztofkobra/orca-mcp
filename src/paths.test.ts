@@ -1,8 +1,8 @@
-import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { checkPath, orcaRoots } from "./paths.js";
+import { checkPath, isScratchTmp, orcaRoots } from "./paths.js";
 import { fakeOrca, mkdtempSync } from "./test/fake-orca.js";
 
 describe("path allowlist", () => {
@@ -34,11 +34,31 @@ describe("path allowlist", () => {
     expect(checkPath(join(home, "dev", "a"), env)).toHaveProperty("error");
   });
 
-  it("allows scratch dirs under the temp root only with ORCA_MCP_TMP_PREFIX, and only with that prefix", () => {
-    const dir = mkdtempSync("/tmp/orca-mcp-scratch-");
+  it("allows scratch dirs under the per-user temp root only with ORCA_MCP_TMP_PREFIX, and only with that prefix", () => {
+    const env = { HOME: "/nowhere", ORCA_MCP_TMP_PREFIX: "orca-mcp-" };
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "orca-mcp-scratch-")));
+    mkdirSync(join(dir, "repo"));
     expect(checkPath(dir, { HOME: "/nowhere" })).toHaveProperty("error");
-    expect(checkPath(dir, { HOME: "/nowhere", ORCA_MCP_TMP_PREFIX: "orca-mcp-" })).toEqual({ path: realpathSync(dir) });
-    expect(checkPath("/tmp/other-dir", { HOME: "/nowhere", ORCA_MCP_TMP_PREFIX: "orca-mcp-" })).toHaveProperty("error");
-    expect(checkPath("/tmp", { HOME: "/nowhere", ORCA_MCP_TMP_PREFIX: "orca-mcp-" })).toHaveProperty("error");
+    expect(checkPath(dir, env)).toEqual({ path: dir });
+    expect(checkPath(join(dir, "repo"), env)).toEqual({ path: join(dir, "repo") });
+    expect(checkPath(join(tmpdir(), "other-dir"), env)).toHaveProperty("error");
+    expect(checkPath(tmpdir(), env)).toHaveProperty("error");
+    expect(checkPath(join(tmpdir(), "orca-mcp-not-created"), env)).toHaveProperty("error");
+  });
+
+  it("refuses a scratch dir another user could have planted: shared /tmp, group/other writable, or not ours", () => {
+    const env = { HOME: "/nowhere", ORCA_MCP_TMP_PREFIX: "orca-mcp-" };
+    if (realpathSync(tmpdir()) !== realpathSync("/tmp")) {
+      const shared = mkdtempSync("/tmp/orca-mcp-shared-");
+      expect(checkPath(shared, env)).toHaveProperty("error");
+    }
+    const open = realpathSync(mkdtempSync(join(tmpdir(), "orca-mcp-open-")));
+    chmodSync(open, 0o777);
+    expect(checkPath(open, env)).toHaveProperty("error");
+    expect(checkPath(join(open, "repo"), env)).toHaveProperty("error");
+    const mine = realpathSync(mkdtempSync(join(tmpdir(), "orca-mcp-mine-")));
+    expect(isScratchTmp(mine, "orca-mcp-")).toBe(true);
+    const foreign = ((p: string) => ({ ...lstatSync(p), isDirectory: () => true, uid: (process.getuid?.() ?? 0) + 1, mode: 0o40700 })) as unknown as typeof lstatSync;
+    expect(isScratchTmp(mine, "orca-mcp-", foreign)).toBe(false);
   });
 });
