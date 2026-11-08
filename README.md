@@ -37,20 +37,13 @@ facts as `structuredContent`.
 
 ## Install
 
-Not on npm yet, so build it from a checkout:
-
-```sh
-git clone https://github.com/krzysztofkobra/orca-mcp && cd orca-mcp
-pnpm install && pnpm build
-```
-
-The server is then `node /abs/path/to/orca-mcp/dist/server.js`. Register it
-with your client (replace the path):
+Published on npm as `@krzysztofkobra/orca-mcp` (the bare `orca-mcp` name belongs to
+another project); clients start it with `npx`. It needs Node 20+ and the Orca desktop app.
 
 **Hermes Agent** (`--args` must come last)
 
 ```sh
-hermes mcp add orca --env ORCA_MCP_ROOTS=$HOME/dev --command node --args /abs/path/to/orca-mcp/dist/server.js
+hermes mcp add orca --env ORCA_MCP_ROOTS=$HOME/dev --command npx --args -y @krzysztofkobra/orca-mcp
 ```
 
 or in `~/.hermes/config.yaml`:
@@ -58,8 +51,8 @@ or in `~/.hermes/config.yaml`:
 ```yaml
 mcp_servers:
   orca:
-    command: "node"
-    args: ["/abs/path/to/orca-mcp/dist/server.js"]
+    command: "npx"
+    args: ["-y", "@krzysztofkobra/orca-mcp"]
     env:
       ORCA_MCP_ROOTS: "/Users/me/dev"
 ```
@@ -67,29 +60,26 @@ mcp_servers:
 **Claude Code**
 
 ```sh
-claude mcp add orca -e ORCA_MCP_ROOTS="$HOME/dev" -- node /abs/path/to/orca-mcp/dist/server.js
+claude mcp add orca -e ORCA_MCP_ROOTS="$HOME/dev" -- npx -y @krzysztofkobra/orca-mcp
 ```
 
 **Codex**
 
 ```sh
-codex mcp add orca --env ORCA_MCP_ROOTS="$HOME/dev" -- node /abs/path/to/orca-mcp/dist/server.js
+codex mcp add orca --env ORCA_MCP_ROOTS="$HOME/dev" -- npx -y @krzysztofkobra/orca-mcp
 ```
 
 or in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.orca]
-command = "node"
-args = ["/abs/path/to/orca-mcp/dist/server.js"]
+command = "npx"
+args = ["-y", "@krzysztofkobra/orca-mcp"]
 env = { ORCA_MCP_ROOTS = "/Users/me/dev" }
 ```
 
-**After publish to npm** (as `@krzysztofkobra/orca-mcp`; the bare `orca-mcp` name
-belongs to another project), the command becomes `npx -y @krzysztofkobra/orca-mcp`, e.g.
-`hermes mcp add orca --command npx --args -y @krzysztofkobra/orca-mcp`,
-`claude mcp add orca -- npx -y @krzysztofkobra/orca-mcp`,
-`codex mcp add orca -- npx -y @krzysztofkobra/orca-mcp`.
+From a checkout instead: `git clone https://github.com/krzysztofkobra/orca-mcp && cd orca-mcp
+&& pnpm install && pnpm build`, then use `node /abs/path/to/orca-mcp/dist/server.js` as the command.
 
 `SKILL.md` is an [Agent Skills](https://agentskills.io) file with the
 coordinator loop; copy it into your client's skills folder (for Claude Code:
