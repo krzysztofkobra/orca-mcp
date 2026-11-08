@@ -40,7 +40,7 @@ facts as `structuredContent`.
 Not on npm yet, so build it from a checkout:
 
 ```sh
-git clone <this repo> orca-mcp && cd orca-mcp
+git clone https://github.com/krzysztofkobra/orca-mcp && cd orca-mcp
 pnpm install && pnpm build
 ```
 
@@ -85,9 +85,11 @@ args = ["/abs/path/to/orca-mcp/dist/server.js"]
 env = { ORCA_MCP_ROOTS = "/Users/me/dev" }
 ```
 
-**After publish to npm**, the command becomes `npx -y orca-mcp`, e.g.
-`hermes mcp add orca --command npx --args -y orca-mcp`,
-`claude mcp add orca -- npx -y orca-mcp`, `codex mcp add orca -- npx -y orca-mcp`.
+**After publish to npm** (as `@krzysztofkobra/orca-mcp`; the bare `orca-mcp` name
+belongs to another project), the command becomes `npx -y @krzysztofkobra/orca-mcp`, e.g.
+`hermes mcp add orca --command npx --args -y @krzysztofkobra/orca-mcp`,
+`claude mcp add orca -- npx -y @krzysztofkobra/orca-mcp`,
+`codex mcp add orca -- npx -y @krzysztofkobra/orca-mcp`.
 
 `SKILL.md` is an [Agent Skills](https://agentskills.io) file with the
 coordinator loop; copy it into your client's skills folder (for Claude Code:
@@ -194,7 +196,7 @@ The flag names live in one adapter (`src/capabilities.ts`).
 The handlers are exported, so a host can wrap them or serve them itself:
 
 ```ts
-import { buildTools, createOrcaMcpServer, type ToolResult } from "orca-mcp";
+import { buildTools, createOrcaMcpServer, type ToolResult } from "@krzysztofkobra/orca-mcp";
 
 const server = createOrcaMcpServer({
   onToolResult: (name, args, result: ToolResult) => {
@@ -219,6 +221,13 @@ pnpm build
 
 Tests run against a fake `orca` binary and a scripted runner; they never touch
 a live Orca.
+
+## Related
+
+[BuildContext/orca-mcp](https://github.com/BuildContext/orca-mcp) is another
+community MCP bridge for Orca, with Streamable HTTP, OAuth and a supervised
+dispatch flow, for remote or shared coordinators. This one stays stdio-only and
+focuses on worker status, server-side waits and the external coordinator mode.
 
 ## License
 

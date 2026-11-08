@@ -1,5 +1,5 @@
 {
-  "name": "orca-mcp",
+  "name": "@krzysztofkobra/orca-mcp",
   "version": "0.1.0",
   "description": "MCP server for Orca: start, watch and steer coding agents running in Orca from any MCP client (Hermes Agent, Claude Code, Codex).",
   "license": "MIT",
@@ -39,7 +39,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "start": "node dist/server.js",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "prepare": "pnpm build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
@@ -49,5 +50,9 @@
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0",
     "vitest": "^5.0.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krzysztofkobra/orca-mcp.git"
   }
 }
