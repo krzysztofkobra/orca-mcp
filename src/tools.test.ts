@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe, REGISTER_RETRY_MS } from "./capabilities.js";
 import type { OrcaResult } from "./orca.js";
+import { ownerComment, ownerOf } from "./agent-state.js";
 import { buildTools, type ToolResult } from "./tools.js";
 import { fakeOrca, fakeTools, scripted } from "./test/fake-orca.js";
 
@@ -136,6 +137,38 @@ describe("tools over the fake binary", () => {
     const f = fakeOrca({ status: { stdout: { ok: true, result: { app: { running: true }, runtime: { state: "ready", reachable: true, appVersion: "1.4.250", capabilities: ["orchestration.contract.v1"] } } } } });
     const r = await fakeTools(f, { orchestration: true }).call("orca_status", {});
     expect(r.text).toBe("ok: Orca app running, runtime ready, version 1.4.250, orchestration on, external coordinator not supported.");
+  });
+});
+
+describe("ownership tag", () => {
+  it("appends the tag to the caller's note and matches only a whole token", async () => {
+    expect(ownerComment("tester", "review by Friday")).toBe("review by Friday orca-mcp:tester");
+    expect(ownerComment("tester")).toBe("orca-mcp:tester");
+    expect(ownerOf("review by Friday orca-mcp:tester")).toBe("tester");
+    expect(ownerOf("orca-mcp:tester extra")).toBe("tester");
+    expect(ownerOf("xorca-mcp:tester")).toBeUndefined();
+    expect(ownerOf("orca-mcp:tester,other")).toBeUndefined();
+    const f = fakeOrca({ "worktree create": { stdout: { ok: true, result: { agentTerminalHandle: "term_1" } } } });
+    await fakeTools(f).call("orca_worktree_create", { repo: join(f.devRoot, "repo"), name: "x", agent: "claude", prompt: "p", comment: "review by Friday" });
+    expect(f.calls()[0]!.argv).toContain("--comment=review by Friday orca-mcp:tester");
+  });
+
+  it("without ORCA_MCP_CLIENT two server instances of one client get different tags", async () => {
+    const tagOf = async () => {
+      const argv: string[][] = [];
+      const list = buildTools({
+        orchestration: async () => false,
+        capabilities: async () => new Set(),
+        env: { HOME: "/nowhere", ORCA_MCP_ROOTS: "/" },
+        client: () => "claude-code",
+        run: async (args) => (argv.push(args), { ok: true, result: { agentTerminalHandle: "term_1" } }),
+      });
+      await (list.find((t) => t.name === "orca_worktree_create")!.handler as (a: unknown) => Promise<ToolResult>)({ repo: "/tmp", name: "x", prompt: "p" });
+      return argv[0]!.find((a) => a.startsWith("--comment="))!;
+    };
+    const [a, b] = [await tagOf(), await tagOf()];
+    expect(a).toMatch(/^--comment=orca-mcp:claude-code-[0-9a-f]{6}$/);
+    expect(a).not.toBe(b);
   });
 });
 

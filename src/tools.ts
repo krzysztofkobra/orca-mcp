@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import {
   aggregateState,
@@ -97,7 +98,11 @@ export interface ToolDeps {
   orchestration?: () => Promise<boolean>;
   capabilities?: () => Promise<ReadonlySet<string>>;
   coordinator?: CoordinatorAdapter;
-  /** The client name workers are tagged with (`orca-mcp:<client>`); read per call, the MCP client is known only after initialize. */
+  /**
+   * The MCP client's name; workers are tagged `orca-mcp:<name>-<per-process suffix>`, so two sessions
+   * of one client never share "mine". `ORCA_MCP_CLIENT` replaces the whole tag with a stable one.
+   * Read per call: the MCP client is known only after initialize.
+   */
   client?: () => string | undefined;
   /**
    * Called after every tool with its parsed arguments and result; a returned
@@ -176,7 +181,11 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const run = (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => runner(args, { timeoutMs, env, ...secrets, ...(signal ? { signal } : {}) });
   const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }));
   const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => runner(args, { ...o, env }));
-  const client = () => clientLabel(env.ORCA_MCP_CLIENT?.trim() || deps.client?.() || undefined);
+  const session = randomBytes(3).toString("hex");
+  const client = () => {
+    const fixed = env.ORCA_MCP_CLIENT?.trim();
+    return fixed ? clientLabel(fixed) : `${clientLabel(deps.client?.()).slice(0, 50)}-${session}`;
+  };
   const now = deps.now ?? Date.now;
   const coord = deps.coordinator ?? coordinatorAdapter((args, o) => runner(args, { ...o, env }), caps.get, client, now);
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -377,11 +386,11 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   };
 
   /** Starts an agent in a fresh worktree the stable way (no orchestration). */
-  const createWorktreeAgent = async (a: { repo: string; name: string; agent: string; prompt: string; model?: string | undefined; effort?: string | undefined; baseBranch?: string | undefined }): Promise<ToolResult> => {
+  const createWorktreeAgent = async (a: { repo: string; name: string; agent: string; prompt: string; model?: string | undefined; effort?: string | undefined; baseBranch?: string | undefined; comment?: string | undefined }): Promise<ToolResult> => {
     const repo = repoSel(a.repo);
     if ("error" in repo) return fail(repo.error);
     const owner = client();
-    const args = ["worktree", "create", `--name=${a.name}`, `--repo=${repo.sel}`, `--agent=${a.agent}`, `--prompt=${a.prompt}`, "--no-parent", `--comment=${ownerComment(owner)}`];
+    const args = ["worktree", "create", `--name=${a.name}`, `--repo=${repo.sel}`, `--agent=${a.agent}`, `--prompt=${a.prompt}`, "--no-parent", `--comment=${ownerComment(owner, a.comment)}`];
     if (a.model) args.push(`--model=${a.model}`);
     if (a.effort) args.push(`--effort=${a.effort}`);
     if (a.baseBranch) args.push(`--base-branch=${a.baseBranch}`);
@@ -398,12 +407,12 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     return reply("working", head, { details: `Wait with orca_wait (terminal ${terminal}), then read with orca_terminal_read.`, data: { worker } });
   };
 
-  const startWorker = async (a: { task?: string | undefined; spec?: string | undefined; repo: string; name: string; agent: string; model?: string | undefined; effort?: string | undefined; run?: string | undefined }): Promise<ToolResult> => {
+  const startWorker = async (a: { task?: string | undefined; spec?: string | undefined; repo: string; name: string; agent: string; model?: string | undefined; effort?: string | undefined; run?: string | undefined; comment?: string | undefined }): Promise<ToolResult> => {
     const repo = repoSel(a.repo);
     if ("error" in repo) return fail(repo.error);
     if (a.effort && !a.model) return fail("effort needs model");
     const owner = client();
-    const args = ["orchestration", "worker-start", a.task ? `--task=${a.task}` : `--spec=${a.spec}`, "--worktree=new-top-level", `--repo=${repo.sel}`, `--name=${a.name}`, `--agent=${a.agent}`, `--comment=${ownerComment(owner)}`];
+    const args = ["orchestration", "worker-start", a.task ? `--task=${a.task}` : `--spec=${a.spec}`, "--worktree=new-top-level", `--repo=${repo.sel}`, `--name=${a.name}`, `--agent=${a.agent}`, `--comment=${ownerComment(owner, a.comment)}`];
     if (a.model) args.push(`--model=${a.model}`);
     if (a.effort) args.push(`--effort=${a.effort}`);
     if (a.run) args.push(`--run=${a.run}`);
@@ -569,8 +578,9 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         model: model.optional(),
         effort: effort.optional(),
         baseBranch: name.optional(),
+        comment: text(500).optional().describe("A note shown on the worktree in Orca; the owner tag is appended to it"),
       },
-      handler: async (a: { repo: string; name: string; agent: string; prompt: string; model?: string | undefined; effort?: string | undefined; baseBranch?: string | undefined }) => createWorktreeAgent(a),
+      handler: async (a: { repo: string; name: string; agent: string; prompt: string; model?: string | undefined; effort?: string | undefined; baseBranch?: string | undefined; comment?: string | undefined }) => createWorktreeAgent(a),
     },
     {
       name: "orca_terminal_read",
@@ -695,12 +705,22 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       name: "orca_worker_start",
       description:
         "Start a coding agent on a task (or a spec) in a new worktree of a repo. Uses Orca orchestration; when that is disabled it falls back to worktree create with the spec as prompt. The worktree is tagged as this client's. Then call orca_wait.",
-      shape: { repo: absPath, name, agent: agent.default("claude"), task: handle.optional(), spec: text(20_000).optional(), model: model.optional(), effort: effort.optional(), run: handle.optional() },
-      handler: async (a: { repo: string; name: string; agent: string; task?: string | undefined; spec?: string | undefined; model?: string | undefined; effort?: string | undefined; run?: string | undefined }) => {
+      shape: {
+        repo: absPath,
+        name,
+        agent: agent.default("claude"),
+        task: handle.optional(),
+        spec: text(20_000).optional(),
+        model: model.optional(),
+        effort: effort.optional(),
+        run: handle.optional(),
+        comment: text(500).optional().describe("A note shown on the worktree in Orca; the owner tag is appended to it"),
+      },
+      handler: async (a: { repo: string; name: string; agent: string; task?: string | undefined; spec?: string | undefined; model?: string | undefined; effort?: string | undefined; run?: string | undefined; comment?: string | undefined }) => {
         if (!a.task === !a.spec) return fail("give exactly one of task or spec");
         if (await orchestration()) return startWorker(a);
         if (!a.spec) return fail("Orca orchestration is disabled here: tasks are unavailable, pass the work as spec");
-        return createWorktreeAgent({ repo: a.repo, name: a.name, agent: a.agent, prompt: a.spec, model: a.model, effort: a.effort });
+        return createWorktreeAgent({ repo: a.repo, name: a.name, agent: a.agent, prompt: a.spec, model: a.model, effort: a.effort, comment: a.comment });
       },
     },
     {

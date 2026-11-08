@@ -15,9 +15,11 @@ import { sep } from "node:path";
 
 /** Prefix of the worktree comment that marks a worker this server started; the rest names the client. */
 export const OWNER_TAG = "orca-mcp:";
-const OWNER_RE = /(?:^|\s)orca-mcp:([\w.-]+)/;
+/** Only a whole whitespace-separated token counts, so `xorca-mcp:a` or `orca-mcp:a,b` in a user's note never claims a worker. */
+const OWNER_RE = /(?:^|\s)orca-mcp:([\w.-]+)(?=\s|$)/;
 
-export const ownerComment = (client: string) => `${OWNER_TAG}${client}`;
+/** The worktree comment: the caller's own note, if any, with the owner tag appended as its last token. */
+export const ownerComment = (client: string, note?: string) => [note?.trim(), `${OWNER_TAG}${client}`].filter(Boolean).join(" ");
 export const ownerOf = (comment: unknown) => (typeof comment === "string" ? OWNER_RE.exec(comment)?.[1] : undefined);
 /** A client name safe to store in a comment and match back: letters, digits, `.`, `_`, `-`. */
 export const clientLabel = (raw: string | undefined) => (raw ?? "").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "orca-mcp";
