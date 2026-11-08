@@ -149,7 +149,8 @@ export class StatusBridge implements PushSource {
         const main = p.mainAgent as { state?: unknown; stateStartedAt?: unknown } | undefined;
         this.panes.set(paneKey, {
           paneKey,
-          workspaceId: str(p.workspaceId) ?? null,
+          // Orca adds `worktreeId` beside `workspaceId` when it delivers the event.
+          workspaceId: str(p.workspaceId) ?? str(p.worktreeId) ?? null,
           ...(str(p.terminalId, 400) ? { terminalId: str(p.terminalId, 400)! } : {}),
           state,
           receivedAt: p.receivedAt,

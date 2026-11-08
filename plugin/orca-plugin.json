@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 2,
+  "id": "agent-status-bridge",
+  "publisher": "krzysztofkobra",
+  "name": "Agent Status Bridge",
+  "version": "0.1.0",
+  "description": "Pushes agent status and workspace events to the orca-mcp servers of this user over a private local socket, so they need not poll.",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "events": [{ "on": "agent.status.changed" }, { "on": "workspace.created" }, { "on": "workspace.removed" }]
+  },
+  "capabilities": [{ "kind": "agent:read" }, { "kind": "workspace:read" }]
+}

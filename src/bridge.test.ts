@@ -71,6 +71,12 @@ describe("StatusBridge listener", () => {
     expect(b.ingest("y".repeat(MAX_LINE_BYTES + 1))).toBe(false);
   });
 
+  it("takes the worktree id Orca adds when the workspace id is missing", () => {
+    const b = new StatusBridge("/nowhere.sock", undefined);
+    expect(b.ingest(JSON.stringify({ v: 1, event: "agent.status.changed", payload: { workspaceId: null, worktreeId: "r::/w/z", paneKey: "p", state: "done", receivedAt: 5 } }))).toBe(true);
+    expect(b.panes.get("p")?.workspaceId).toBe("r::/w/z");
+  });
+
   it("refuses a dir or socket path another user could have planted, and replaces its own stale socket", async () => {
     const base = realpathSync(mkdtempSync(join(tmpdir(), "orca-mcp-br-")));
     const foreign = ((p: string) => ({ ...lstatSync(p), isSymbolicLink: () => false, isDirectory: () => true, uid: (process.getuid?.() ?? 0) + 1 })) as unknown as typeof lstatSync;
