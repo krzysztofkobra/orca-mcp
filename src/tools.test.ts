@@ -149,6 +149,7 @@ describe("ownership tag", () => {
     expect(ownerOf("orca-mcp:tester extra")).toBe("tester");
     expect(ownerOf("xorca-mcp:tester")).toBeUndefined();
     expect(ownerOf("orca-mcp:tester,other")).toBeUndefined();
+    expect(ownerOf(ownerComment("tester", "orca-mcp:intruder"))).toBe("tester");
     const f = fakeOrca({ "worktree create": { stdout: { ok: true, result: { agentTerminalHandle: "term_1" } } } });
     await fakeTools(f).call("orca_worktree_create", { repo: join(f.devRoot, "repo"), name: "x", agent: "claude", prompt: "p", comment: "review by Friday" });
     expect(f.calls()[0]!.argv).toContain("--comment=review by Friday orca-mcp:tester");
