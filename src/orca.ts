@@ -45,7 +45,14 @@ export interface OrcaOptions {
   env?: NodeJS.ProcessEnv;
   /** More credential shapes to refuse on argv, on top of the built-in ones (an embedder's own token formats). */
   extraSecretPatterns?: readonly RegExp[];
+  /**
+   * The external coordinator identity of a coordinator call. Only these two variables pass, and
+   * only on calls that set them: the key is a credential and never goes on argv, where `ps` shows it.
+   */
+  coordinatorEnv?: { [K in (typeof COORDINATOR_ENV)[number]]?: string };
 }
+
+export const COORDINATOR_ENV = ["ORCA_EXTERNAL_COORDINATOR", "ORCA_EXTERNAL_COORDINATOR_KEY"] as const;
 
 export type OrcaResult =
   | { ok: true; result: unknown }
@@ -138,6 +145,10 @@ export function runJsonCli(name: string, bin: string, args: readonly string[], o
   const srcEnv = opts.env ?? process.env;
   const env: NodeJS.ProcessEnv = {};
   for (const k of ENV_PASSTHROUGH) if (srcEnv[k] !== undefined) env[k] = srcEnv[k];
+  for (const k of COORDINATOR_ENV) {
+    const v = opts.coordinatorEnv?.[k];
+    if (v) env[k] = v;
+  }
 
   return new Promise((resolve) => {
     let settled = false;

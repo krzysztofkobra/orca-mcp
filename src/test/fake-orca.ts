@@ -21,7 +21,7 @@ export type FakeReply = { stdout?: unknown; exit?: number; sleepMs?: number; byt
  * first two argv words (or the first) to a reply, and every call's argv and env
  * names are appended to `argv.log` as one JSON line.
  */
-export function fakeOrca(responses: Record<string, FakeReply>) {
+export function fakeOrca(responses: Record<string, FakeReply | FakeReply[]>) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "orca-mcp-fake-")));
   const bin = join(home, "orca");
   writeFileSync(join(home, "responses.json"), JSON.stringify(responses));
@@ -31,9 +31,18 @@ export function fakeOrca(responses: Record<string, FakeReply>) {
 const fs = require("fs"), path = require("path");
 const home = process.env.HOME;
 const argv = process.argv.slice(2);
-fs.appendFileSync(path.join(home, "argv.log"), JSON.stringify({ argv, env: Object.keys(process.env).sort() }) + "\\n");
+const coord = Object.fromEntries(["ORCA_EXTERNAL_COORDINATOR", "ORCA_EXTERNAL_COORDINATOR_KEY"].filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
+fs.appendFileSync(path.join(home, "argv.log"), JSON.stringify({ argv, env: Object.keys(process.env).sort(), coord }) + "\\n");
 const r = JSON.parse(fs.readFileSync(path.join(home, "responses.json"), "utf8"));
-const spec = r[argv.slice(0, 2).join(" ")] ?? r[argv[0]] ?? { stdout: { ok: true, result: {} } };
+const name = argv.slice(0, 2).join(" ");
+let spec = r[name] ?? r[argv[0]] ?? { stdout: { ok: true, result: {} } };
+// A list of replies is used in order, the last one repeating.
+if (Array.isArray(spec)) {
+  const counter = path.join(home, "count-" + name.replace(/\\W+/g, "_"));
+  const n = fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0;
+  fs.writeFileSync(counter, String(n + 1));
+  spec = spec[Math.min(n, spec.length - 1)];
+}
 const done = () => {
   if (spec.bytes) process.stdout.write("x".repeat(spec.bytes));
   else if (spec.raw !== undefined) process.stdout.write(spec.raw);
@@ -51,8 +60,8 @@ spec.sleepMs ? setTimeout(done, spec.sleepMs) : done();
     readFileSync(join(home, "argv.log"), "utf8")
       .trim()
       .split("\n")
-      .map((l) => JSON.parse(l) as { argv: string[]; env: string[] });
-  const setReplies = (more: Record<string, FakeReply>) => writeFileSync(join(home, "responses.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(home, "responses.json"), "utf8")), ...more }));
+      .map((l) => JSON.parse(l) as { argv: string[]; env: string[]; coord: Record<string, string> });
+  const setReplies = (more: Record<string, FakeReply | FakeReply[]>) => writeFileSync(join(home, "responses.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(home, "responses.json"), "utf8")), ...more }));
   return { home, bin, env, devRoot, calls, setReplies };
 }
 
@@ -66,13 +75,14 @@ async function invoke(list: ReturnType<typeof buildTools>, name: string, args: R
 }
 
 /** Tools wired to a fake binary. */
-export function fakeTools(f: ReturnType<typeof fakeOrca>, opts: { orchestration?: boolean; caps?: string[]; envExtra?: Record<string, string> } = {}) {
+export function fakeTools(f: ReturnType<typeof fakeOrca>, opts: { orchestration?: boolean; caps?: string[]; envExtra?: Record<string, string>; deps?: Partial<ToolDeps> } = {}) {
   const env = { ...f.env, ...opts.envExtra };
   const list = buildTools({
     orchestration: async () => opts.orchestration ?? false,
     capabilities: async () => new Set(opts.caps ?? []),
     env,
     run: (args, o) => runOrca(args, { ...o, bin: f.bin, env }),
+    ...opts.deps,
   });
   return { call: (name: string, args: Record<string, unknown>) => invoke(list, name, args) };
 }
@@ -82,7 +92,7 @@ export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestr
   const calls: string[][] = [];
   const queues = new Map(Object.entries(replies).map(([k, v]) => [k, [...v]]));
   let t = 1_000_000;
-  const key = (args: string[]) => (args[0] === "orchestration" && args[1] === "external" ? args.slice(0, 3).join(" ") : args.slice(0, 2).join(" "));
+  const key = (args: string[]) => args.slice(0, 2).join(" ");
   const list = buildTools({
     orchestration: async () => opts.orchestration ?? false,
     capabilities: async () => new Set(opts.caps ?? []),
@@ -97,6 +107,7 @@ export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestr
       t += ms;
     },
     pollMs: 5000,
+    coordinatorStore: null,
     ...opts.deps,
   });
   return {

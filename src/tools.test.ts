@@ -1,10 +1,11 @@
-import { join } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe, REGISTER_RETRY_MS } from "./capabilities.js";
 import type { OrcaResult } from "./orca.js";
 import { ownerComment, ownerOf } from "./agent-state.js";
 import { buildTools, type ToolResult } from "./tools.js";
-import { fakeOrca, fakeTools, scripted } from "./test/fake-orca.js";
+import { fakeOrca, fakeTools, scripted, type FakeReply } from "./test/fake-orca.js";
 
 describe("tools over the fake binary", () => {
   it("orca_worktree_create builds the exact argv, tags the worktree and returns the worker", async () => {
@@ -169,6 +170,95 @@ describe("ownership tag", () => {
     const [a, b] = [await tagOf(), await tagOf()];
     expect(a).toMatch(/^--comment=orca-mcp:claude-code-[0-9a-f]{6}$/);
     expect(a).not.toBe(b);
+  });
+});
+
+describe("external coordinator over the fake binary", () => {
+  const KEY1 = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v";
+  const KEY2 = "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0F9e";
+  const registered = (key: string): FakeReply => ({ stdout: { ok: true, result: { coordinator: { id: "ext_1", address: "external:ext_1", label: "tester", createdAt: "2026-11-08" }, externalCoordinatorKey: key } } });
+  const external = { orchestration: true, caps: [EXTERNAL_COORDINATOR_CAPABILITY] };
+  const saved = (f: ReturnType<typeof fakeOrca>) => join(f.home, "Library", "Application Support", "orca-mcp", "external-coordinator-tester.json");
+  const stateFile = (f: ReturnType<typeof fakeOrca>) => (process.platform === "darwin" ? saved(f) : join(f.home, ".local", "state", "orca-mcp", "external-coordinator-tester.json"));
+
+  it("the key rides only in the env of coordinator calls, never in argv or any result", async () => {
+    const f = fakeOrca({
+      "orchestration external-register": registered(KEY1),
+      // Even an Orca reply that echoed the key must not reach the model.
+      "orchestration run-create": { stdout: { ok: true, result: { runId: "run_7", debug: `key ${KEY1}` } } },
+      "orchestration worker-start": { stdout: { ok: true, result: { dispatchId: "disp_1", runId: "run_7", state: "ready" } } },
+      "orchestration check": { stdout: { ok: true, result: { messages: [{ id: "m1", type: "worker_done", from: "disp_1" }] } } },
+    });
+    const { call } = fakeTools(f, external);
+    const results = [
+      await call("orca_run_create", { objective: "ship it" }),
+      await call("orca_worker_start", { repo: join(f.devRoot, "repo"), name: "w", agent: "claude", spec: "s", run: "run_7" }),
+      await call("orca_wait", { run: "run_7", timeoutMs: 60_000 }),
+      await call("orca_worktrees", {}),
+    ];
+    expect(results[0]).toMatchObject({ state: "ok", summary: "Run run_7 created (coordinator external:ext_1)." });
+    expect(results[2]).toMatchObject({ state: "done" });
+    expect(JSON.stringify(results)).not.toContain(KEY1);
+    expect(JSON.stringify(results[0]!.data)).toContain("[redacted]");
+    const calls = f.calls();
+    expect(calls.some((c) => c.argv.some((a) => a.includes(KEY1)))).toBe(false);
+    expect(calls[0]!.argv).toEqual(["orchestration", "external-register", "--label=tester", "--json"]);
+    const coordinatorCalls = calls.filter((c) => ["run-create", "worker-start", "check"].includes(c.argv[1]!));
+    expect(coordinatorCalls).toHaveLength(3);
+    for (const c of coordinatorCalls) expect(c.coord).toEqual({ ORCA_EXTERNAL_COORDINATOR: "external:ext_1", ORCA_EXTERNAL_COORDINATOR_KEY: KEY1 });
+    // Everything else runs without them.
+    for (const c of calls.filter((x) => !coordinatorCalls.includes(x))) expect(c.coord).toEqual({});
+    // A model pasting the key into a command is refused before anything runs.
+    const echoed = await call("orca_terminal_send", { terminal: "term_1", text: `key is ${KEY1}` });
+    expect(echoed.isError).toBe(true);
+    expect(f.calls()).toHaveLength(calls.length);
+    expect(JSON.stringify(echoed)).not.toContain(KEY1);
+  });
+
+  it("keeps {id, key} in a 0600 file and resumes after a restart with the old key, storing the rotated one", async () => {
+    const f = fakeOrca({ "orchestration external-register": [registered(KEY1), registered(KEY2)], "orchestration run-create": { stdout: { ok: true, result: { runId: "run_7" } } } });
+    await fakeTools(f, external).call("orca_run_create", { objective: "first life" });
+    const file = stateFile(f);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(file)).mode & 0o777).toBe(0o700);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ id: "ext_1", key: KEY1 });
+    // A new server process (new tools, same client tag).
+    await fakeTools(f, external).call("orca_run_create", { objective: "second life" });
+    const registers = f.calls().filter((c) => c.argv[1] === "external-register");
+    expect(registers[1]!.argv).toEqual(["orchestration", "external-register", "--label=tester", "--resume=external:ext_1", "--json"]);
+    expect(registers[1]!.coord).toEqual({ ORCA_EXTERNAL_COORDINATOR_KEY: KEY1 });
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ id: "ext_1", key: KEY2 });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(f.calls().at(-1)!.coord).toEqual({ ORCA_EXTERNAL_COORDINATOR: "external:ext_1", ORCA_EXTERNAL_COORDINATOR_KEY: KEY2 });
+  });
+
+  it("a refused resume (wrong key) registers a fresh coordinator and rewrites the file", async () => {
+    const f = fakeOrca({
+      "orchestration external-register": [registered(KEY1), { stdout: { ok: false, error: { code: "external_coordinator_key_invalid", message: "This request does not carry the current registration key" } }, exit: 1 }, { stdout: { ok: true, result: { coordinator: { id: "ext_9", address: "external:ext_9" }, externalCoordinatorKey: KEY2 } } }],
+      "orchestration run-create": { stdout: { ok: true, result: { runId: "run_7" } } },
+    });
+    await fakeTools(f, external).call("orca_run_create", { objective: "a" });
+    const r = await fakeTools(f, external).call("orca_run_create", { objective: "b" });
+    expect(r.summary).toBe("Run run_7 created (coordinator external:ext_9).");
+    expect(f.calls().filter((c) => c.argv[1] === "external-register").map((c) => c.argv.some((a) => a.startsWith("--resume")))).toEqual([false, true, false]);
+    expect(JSON.parse(readFileSync(stateFile(f), "utf8"))).toEqual({ id: "ext_9", key: KEY2 });
+  });
+
+  it("inside an Orca terminal (external_from_agent_context) it says so and falls back to legacy mode", async () => {
+    const f = fakeOrca({
+      "orchestration external-register": { stdout: { ok: false, error: { code: "external_from_agent_context", message: "This command runs inside an Orca terminal or agent session" } }, exit: 1 },
+      "orchestration run-create": { stdout: { ok: true, result: { runId: "run_3" } } },
+    });
+    const { call } = fakeTools(f, external);
+    const r = await call("orca_run_create", { objective: "x" });
+    expect(r).toMatchObject({ state: "ok", summary: "Run run_3 created (coordinator legacy).", data: { coordinator: "legacy" } });
+    const runCreate = f.calls().find((c) => c.argv[1] === "run-create")!;
+    expect(runCreate.coord).toEqual({});
+    expect(existsSync(stateFile(f))).toBe(false);
+    // A refused run-create names the reason.
+    f.setReplies({ "orchestration run-create": { stdout: { ok: false, error: { code: "stable_pane_required", message: "needs a pane" } }, exit: 1 } });
+    const refused = await call("orca_run_create", { objective: "y" });
+    expect(refused.summary).toMatch(/runs inside an Orca terminal or agent session \(external_from_agent_context\)/);
   });
 });
 
@@ -491,28 +581,6 @@ describe("orca_agent_status", () => {
 });
 
 describe("capability awareness", () => {
-  it("with an external coordinator capability, run-create registers once and every coordinator call carries --from", async () => {
-    const o = scripted(
-      {
-        "orchestration external register": [{ ok: true, result: { id: "external:ext_1", generation: 1 } }],
-        "orchestration run-create": [{ ok: true, result: { runId: "run_7" } }],
-        "orchestration check": [{ ok: true, result: { messages: [{ id: "m1", type: "worker_done", from: "disp_1" }] } }],
-      },
-      { orchestration: true, caps: [EXTERNAL_COORDINATOR_CAPABILITY] },
-    );
-    const r = await o.call("orca_run_create", { objective: "ship it" });
-    expect(r).toMatchObject({ state: "ok", summary: "Run run_7 created (coordinator external:ext_1).", data: { runId: "run_7", coordinator: "external:ext_1" } });
-    await o.call("orca_worker_start", { repo: "/nowhere/repo", name: "w", agent: "claude", spec: "s", run: "run_7" });
-    // No target: the run this server created.
-    const w = await o.call("orca_wait", { timeoutMs: 60_000 });
-    expect(w).toMatchObject({ state: "done", data: { runId: "run_7" } });
-    expect(o.calls[0]).toEqual(["orchestration", "external", "register", "--label=tester"]);
-    expect(o.calls[1]).toEqual(["orchestration", "run-create", "--objective=ship it", "--from=external:ext_1"]);
-    expect(o.calls.find((c) => c[1] === "worker-start")!.at(-1)).toBe("--from=external:ext_1");
-    expect(o.calls.find((c) => c[1] === "check")!.at(-1)).toBe("--from=external:ext_1");
-    expect(o.kinds().filter((k) => k === "orchestration external register")).toHaveLength(1);
-  });
-
   it("without the capability, nothing registers and no call carries --from (today's behaviour)", async () => {
     const o = scripted({ "orchestration run-create": [{ ok: true, result: { run: { id: "run_8" } } }] }, { orchestration: true, caps: ["orchestration.contract.v1"] });
     const r = await o.call("orca_run_create", { objective: "ship it" });
@@ -531,16 +599,19 @@ describe("capability awareness", () => {
 
   it("a register that fails falls back to legacy, stays there for the retry window, then tries again", async () => {
     const o = scripted(
-      { "orchestration external register": [{ ok: false, error: "orca error: unknown command" }, { ok: true, result: { coordinator: { id: "ext_2" } } }], "orchestration run-create": [{ ok: true, result: { runId: "run_9" } }] },
+      {
+        "orchestration external-register": [{ ok: false, error: "orca error: runtime busy", code: "runtime_busy" }, { ok: true, result: { coordinator: { id: "ext_2", address: "external:ext_2" }, externalCoordinatorKey: "k".repeat(43) } }],
+        "orchestration run-create": [{ ok: true, result: { runId: "run_9" } }],
+      },
       { orchestration: true, caps: [EXTERNAL_COORDINATOR_CAPABILITY] },
     );
     expect((await o.call("orca_run_create", { objective: "a" })).data.coordinator).toBe("legacy");
     expect(o.calls[1]).toEqual(["orchestration", "run-create", "--objective=a"]);
     expect((await o.call("orca_run_create", { objective: "b" })).data.coordinator).toBe("legacy");
-    expect(o.kinds().filter((k) => k === "orchestration external register")).toHaveLength(1);
+    expect(o.kinds().filter((k) => k === "orchestration external-register")).toHaveLength(1);
     o.at(1_000_000 + REGISTER_RETRY_MS);
     expect((await o.call("orca_run_create", { objective: "c" })).data.coordinator).toBe("external:ext_2");
-    expect(o.kinds().filter((k) => k === "orchestration external register")).toHaveLength(2);
+    expect(o.kinds().filter((k) => k === "orchestration external-register")).toHaveLength(2);
   });
 
   it("an orchestration probe failure is not cached, a success is", async () => {

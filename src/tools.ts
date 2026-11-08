@@ -24,7 +24,8 @@ import {
 import { capabilitiesOf, capabilityProbe, coordinatorAdapter, EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe, type CoordinatorAdapter } from "./capabilities.js";
 import type { PushSource } from "./bridge.js";
 import { checkPath } from "./paths.js";
-import { runOrca, type OrcaResult, type OrcaRunner } from "./orca.js";
+import { fileCoordinatorStore, stateDir, type CoordinatorStore } from "./state-store.js";
+import { runOrca, type OrcaOptions, type OrcaResult, type OrcaRunner } from "./orca.js";
 
 /*
  * Tool -> orca argv. Flags checked against `orca agent-context --json` and
@@ -94,6 +95,8 @@ export interface ToolResult {
 export interface ToolDeps {
   run?: OrcaRunner;
   env?: NodeJS.ProcessEnv;
+  /** Where the external coordinator id and key are kept across restarts; null keeps them in memory only. Default: a file under the state dir when ORCA_MCP_CLIENT is set. */
+  coordinatorStore?: CoordinatorStore | null;
   /** Passed to every orca call: more credential shapes to refuse on argv. */
   extraSecretPatterns?: readonly RegExp[];
   orchestration?: () => Promise<boolean>;
@@ -190,8 +193,16 @@ type HookMode = "all" | "attention" | false;
 export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const env = deps.env ?? process.env;
   const runner = deps.run ?? runOrca;
-  const secrets = deps.extraSecretPatterns ? { extraSecretPatterns: deps.extraSecretPatterns } : {};
-  const run = (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => runner(args, { timeoutMs, env, ...secrets, ...(signal ? { signal } : {}) });
+  // The adapter's keys join the refused argv shapes: a model must never echo one onto a command line.
+  const secretPatterns = () => [...(deps.extraSecretPatterns ?? []), ...coord.secrets().map((k) => new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))];
+  const run = (args: string[], timeoutMs = READ_MS, signal?: AbortSignal, coordinatorEnv?: OrcaOptions["coordinatorEnv"]) =>
+    runner(args, { timeoutMs, env, extraSecretPatterns: secretPatterns(), ...(signal ? { signal } : {}), ...(coordinatorEnv && Object.keys(coordinatorEnv).length ? { coordinatorEnv } : {}) });
+  /** A coordinator call: the external identity and key ride in the child env, and a refusal that voids the identity is reported back. */
+  const runAs = async (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => {
+    const r = await run(args, timeoutMs, signal, await coord.env());
+    if (!r.ok) coord.refused(r.code);
+    return r;
+  };
   const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }));
   const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => runner(args, { ...o, env }));
   const session = randomBytes(3).toString("hex");
@@ -200,7 +211,9 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     return fixed ? clientLabel(fixed) : `${clientLabel(deps.client?.()).slice(0, 50)}-${session}`;
   };
   const now = deps.now ?? Date.now;
-  const coord = deps.coordinator ?? coordinatorAdapter((args, o) => runner(args, { ...o, env }), caps.get, client, now);
+  // Saved across restarts only under a stable tag; a per-process tag would leave a file per run.
+  const store = deps.coordinatorStore !== undefined ? deps.coordinatorStore ?? undefined : env.ORCA_MCP_CLIENT?.trim() ? fileCoordinatorStore(stateDir(env), clientLabel(env.ORCA_MCP_CLIENT.trim())) : undefined;
+  const coord = deps.coordinator ?? coordinatorAdapter((args, o) => runner(args, { ...o, env }), caps.get, client, now, store);
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const pollMs = deps.pollMs ?? POLL_MS;
 
@@ -410,13 +423,12 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const waitMail = async (runId: string, timeoutMs: number, fromDispatch?: string, signal?: AbortSignal): Promise<Outcome | { kind: "failed"; failed: OrcaResult & { ok: false } }> => {
     const start = now();
     const deadline = start + timeoutMs;
-    const from = await coord.fromArgs();
     let waitArgs = true;
     for (;;) {
       if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
       const rest = Math.max(1000, deadline - now());
-      const args = ["orchestration", "check", `--run=${runId}`, "--peek", `--types=${WAKE_TYPES.join(",")}`, ...(waitArgs ? ["--wait", `--timeout-ms=${rest}`] : []), ...from];
-      const r = await run(args, waitArgs ? rest + 15_000 : READ_MS, signal);
+      const args = ["orchestration", "check", `--run=${runId}`, "--peek", `--types=${WAKE_TYPES.join(",")}`, ...(waitArgs ? ["--wait", `--timeout-ms=${rest}`] : [])];
+      const r = await runAs(args, waitArgs ? rest + 15_000 : READ_MS, signal);
       if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
       if (!r.ok) return { kind: "failed", failed: r };
       const res = r.result as { messages?: MailMessage[]; timedOut?: boolean } | undefined;
@@ -480,8 +492,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     if (a.model) args.push(`--model=${a.model}`);
     if (a.effort) args.push(`--effort=${a.effort}`);
     if (a.run) args.push(`--run=${a.run}`);
-    args.push(...(await coord.fromArgs()));
-    const r = await run(args, CREATE_MS);
+    const r = await runAs(args, CREATE_MS);
     if (!r.ok) return fail(r.error, r.code ? { code: r.code } : undefined);
     const dispatch = pick(r.result, ["dispatchId", "dispatch.id", "dispatch_id", "id"]);
     const task = pick(r.result, ["taskId", "task.id"]);
@@ -783,7 +794,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       handler: async (a: { objective: string }) => {
         if (!(await orchestration())) return fail("Orca orchestration is disabled here; use orca_worktree_create (worktree + agent) instead");
         const mode = await coord.mode();
-        const r = await run(["orchestration", "run-create", `--objective=${a.objective}`, ...(mode.kind === "external" ? [`--from=external:${mode.id}`] : [])]);
+        const r = await runAs(["orchestration", "run-create", `--objective=${a.objective}`]);
         const coordinator = mode.kind === "external" ? `external:${mode.id}` : "legacy";
         if (!r.ok) {
           const hint = mode.kind === "legacy" ? ` (no external coordinator: ${mode.reason}; orca_worker_start with a spec creates its own Run)` : "";
@@ -804,8 +815,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         if (a.title) args.push(`--task-title=${a.title}`);
         if (a.run) args.push(`--run=${a.run}`);
         if (a.deps?.length) args.push(`--deps=${JSON.stringify(a.deps)}`);
-        args.push(...(await coord.fromArgs()));
-        const r = await run(args);
+        const r = await runAs(args);
         if (!r.ok) return fail(r.error);
         const taskId = pick(r.result, ["taskId", "task.id", "id"]);
         return ok(`Task ${taskId ?? "?"} created.`, { data: { taskId, result: r.result } });
@@ -849,8 +859,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         if (a.run) args.push(`--run=${a.run}`);
         if (a.terminal) args.push(`--terminal=${a.terminal}`);
         if (!a.peek) args.push("--wait", `--timeout-ms=${a.timeoutMs}`);
-        args.push(...(await coord.fromArgs()));
-        const r = await run(args, a.peek ? READ_MS : a.timeoutMs + 15_000);
+        const r = await runAs(args, a.peek ? READ_MS : a.timeoutMs + 15_000);
         if (!r.ok) return fail(r.error);
         const res = r.result as { messages?: MailMessage[]; timedOut?: boolean };
         const msgs = res?.messages ?? [];
@@ -899,8 +908,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const args = ["orchestration", "send", `--to=${a.to}`, `--subject=${a.subject ?? a.body.slice(0, 80)}`, `--body=${a.body}`];
         if (a.type) args.push(`--type=${a.type}`);
         if (a.run) args.push(`--run=${a.run}`);
-        args.push(...(await coord.fromArgs()));
-        const r = await run(args);
+        const r = await runAs(args);
         return r.ok ? ok(`Sent to ${a.to}.`, { data: { result: r.result } }) : fail(r.error);
       },
     },
@@ -943,11 +951,19 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const parsed = schema.safeParse(raw ?? {});
         if (!parsed.success) return fail(`invalid arguments for ${t.name}: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"} ${i.message}`).join("; ")}`);
         const args = parsed.data as never;
-        const r = await t.handler(args);
+        const r = redact(await t.handler(args), coord.secrets());
         return hook ? ((await hook(t.name, args, r)) ?? r) : r;
       },
     };
   });
+}
+
+/** A result with every held credential replaced, in its text and its structured content alike. */
+function redact(r: ToolResult, secrets: readonly string[]): ToolResult {
+  if (!secrets.length) return r;
+  const clean = (s: string) => secrets.reduce((acc, k) => acc.split(k).join("[redacted]"), s);
+  const raw = JSON.stringify(r);
+  return raw === clean(raw) ? r : (JSON.parse(clean(raw)) as ToolResult);
 }
 
 /** Terminal/worker output as plain text plus the cursor for the next read. */
