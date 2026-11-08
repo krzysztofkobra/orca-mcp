@@ -243,17 +243,27 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     return direct;
   };
 
-  /** `worktree ps`, overlaid with pushed agent states while the plugin is connected. */
-  const readPs = async (signal?: AbortSignal): Promise<OrcaResult & { pushed?: boolean }> => {
+  /**
+   * `worktree ps`, overlaid with pushed agent states while the plugin is connected. `seq` is the
+   * bridge's event count from before the read, so an event that lands during it still wakes the
+   * next wait; `overlaid` says a pushed state replaced one ps reported.
+   */
+  type PsRead = OrcaResult & { pushed?: boolean; seq?: number; overlaid?: boolean };
+  const readPs = async (signal?: AbortSignal): Promise<PsRead> => {
+    const seq = deps.bridge?.seq();
     const ps = await run(["worktree", "ps"], 10_000, signal);
-    if (!ps.ok || !deps.bridge?.connected()) return ps;
-    return { ok: true, result: { ...(ps.result as object), worktrees: deps.bridge.overlay(psRows(ps.result)) }, pushed: true };
+    if (!ps.ok || !deps.bridge?.connected()) return { ...ps, ...(seq !== undefined ? { seq } : {}) };
+    const worktrees = deps.bridge.overlay(psRows(ps.result));
+    return { ok: true, result: { ...(ps.result as object), worktrees }, pushed: true, seq: seq ?? 0, overlaid: worktrees.some((r) => r.agents?.some((x) => x.pushed)) };
   };
 
-  /** Until the next read of a hook-state wait: the plugin's next event when it is connected, else the poll interval. */
-  const nextRead = async (deadline: number, signal?: AbortSignal) => {
+  /**
+   * Until the next read of a hook-state wait: the plugin's next event when it is connected, else
+   * the poll interval. Right after an overlay ps still lags behind (no message yet), so it polls.
+   */
+  const nextRead = async (deadline: number, read: PsRead | undefined, signal?: AbortSignal) => {
     const ms = Math.max(0, deadline - now());
-    if (deps.bridge?.connected()) await deps.bridge.changed(Math.min(PUSH_SAFETY_MS, ms), signal);
+    if (deps.bridge?.connected() && !read?.overlaid) await deps.bridge.changed(read?.seq ?? deps.bridge.seq(), Math.min(PUSH_SAFETY_MS, ms), signal);
     else await pause(Math.min(pollMs, ms), signal);
   };
 
@@ -316,7 +326,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
           const tool = typeof last?.pane.toolName === "string" ? `, last tool ${last.pane.toolName}` : "";
           return reply("working", `Still running after ${Math.round((now() - start) / 1000)} s${tool}.`, { details: details("Wait again with orca_wait."), data: { via: "hook", ...(last ? { worker: workerStatus(last.row, last.pane, { terminal, includeMessage: false, now: now() }) } : {}) } });
         }
-        await nextRead(deadline);
+        await nextRead(deadline, ps);
       }
     }
     // No pane behind the terminal, or its agent reports no hook state: the TUI's own idle signal.
@@ -388,7 +398,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       }
       if (now() - start >= HOOKLESS_MS && watched === 0 && ps.ok) return none(reply("idle", `No live agent in the ${label} after ${Math.round((now() - start) / 1000)} s.`, { details: note, data: { via: "hook" } }));
       if (now() >= deadline) return none(reply("working", `Still running after ${Math.round((now() - start) / 1000)} s (${watched} agent${watched === 1 ? "" : "s"} in the ${label}).`, { details: details("Wait again with orca_wait."), data: { via: "hook" } }));
-      await nextRead(deadline, signal);
+      await nextRead(deadline, ps.ok ? ps : undefined, signal);
     }
   };
 
