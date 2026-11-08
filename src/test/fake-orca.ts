@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync as mkdtempRaw, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll } from "vitest";
-import { buildTools, type ToolDeps } from "../tools.js";
+import { buildTools, type ToolDeps, type ToolResult } from "../tools.js";
 import { runOrca, type OrcaResult } from "../orca.js";
 
 const made: string[] = [];
@@ -61,7 +61,7 @@ type CallOut = { text: string; isError: boolean; state: string; summary: string;
 async function invoke(list: ReturnType<typeof buildTools>, name: string, args: Record<string, unknown>): Promise<CallOut> {
   const t = list.find((x) => x.name === name);
   if (!t) throw new Error(`no tool ${name}`);
-  const r = await (t.handler as (a: unknown) => ReturnType<typeof t.handler>)(args);
+  const r = await (t.handler as (a: unknown) => Promise<ToolResult>)(args);
   return { text: r.content[0]!.text, isError: !!r.isError, state: r.structuredContent.state, summary: r.structuredContent.summary, data: r.structuredContent };
 }
 
