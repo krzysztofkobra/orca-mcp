@@ -25,9 +25,13 @@ structured content. Read the state, not the prose: `working`, `waiting`,
   questions or report `worker_done`. Needs Orca orchestration
   (`orca_status` says `orchestration on`). Without it `orca_worker_start` falls
   back to a plain worktree by itself.
-- `orca_run_create` needs a coordinator identity. When `orca_status` says
-  `external coordinator supported`, the server registers one for you. Otherwise
-  skip it: `orca_worker_start` with a `spec` creates its own Run.
+- `orca_run_create` needs a coordinator identity. That takes an Orca build with
+  `orchestration.external-coordinator.v1`: when `orca_status` says
+  `external coordinator supported`, the server registers as an external
+  coordinator by itself and keeps its key out of your context. Otherwise skip
+  `orca_run_create`: `orca_worker_start` with a `spec` creates its own Run. If a
+  result says orca-mcp runs inside an Orca terminal (`external_from_agent_context`),
+  external mode is unavailable there too.
 
 ## Coordinator loop
 
