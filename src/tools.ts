@@ -92,6 +92,8 @@ export interface ToolResult {
 export interface ToolDeps {
   run?: OrcaRunner;
   env?: NodeJS.ProcessEnv;
+  /** Passed to every orca call: more credential shapes to refuse on argv. */
+  extraSecretPatterns?: readonly RegExp[];
   orchestration?: () => Promise<boolean>;
   capabilities?: () => Promise<ReadonlySet<string>>;
   coordinator?: CoordinatorAdapter;
@@ -170,7 +172,8 @@ type MailMessage = { id?: string; type?: string; from?: string; subject?: string
 export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const env = deps.env ?? process.env;
   const runner = deps.run ?? runOrca;
-  const run = (args: string[], timeoutMs = READ_MS) => runner(args, { timeoutMs, env });
+  const secrets = deps.extraSecretPatterns ? { extraSecretPatterns: deps.extraSecretPatterns } : {};
+  const run = (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => runner(args, { timeoutMs, env, ...secrets, ...(signal ? { signal } : {}) });
   const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }));
   const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => runner(args, { ...o, env }));
   const client = () => clientLabel(env.ORCA_MCP_CLIENT?.trim() || deps.client?.() || undefined);

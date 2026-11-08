@@ -43,6 +43,8 @@ export interface OrcaOptions {
   timeoutMs?: number;
   maxBytes?: number;
   env?: NodeJS.ProcessEnv;
+  /** More credential shapes to refuse on argv, on top of the built-in ones (an embedder's own token formats). */
+  extraSecretPatterns?: readonly RegExp[];
 }
 
 export type OrcaResult =
@@ -58,8 +60,8 @@ export type OrcaRunner = (args: string[], opts?: OrcaOptions) => Promise<OrcaRes
  */
 const SECRET_SHAPES = /sk-ant-[\w-]{10,}|sk-[A-Za-z0-9]{32,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{20,}|glpat-[\w-]{20,}|xox[abpr]-[\w-]{10,}|AKIA[0-9A-Z]{16}|AIza[\w-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 
-export function containsSecret(args: readonly string[]): boolean {
-  return args.some((a) => SECRET_SHAPES.test(a));
+export function containsSecret(args: readonly string[], extra: readonly RegExp[] = []): boolean {
+  return args.some((a) => SECRET_SHAPES.test(a) || extra.some((re) => new RegExp(re.source, re.flags.replace("g", "")).test(a)));
 }
 
 /** Whole seconds when the timeout is a whole number of seconds, else milliseconds: never a rounded "0 s". */
@@ -132,7 +134,7 @@ export function runJsonCli(name: string, bin: string, args: readonly string[], o
   if (opts.signal?.aborted) return Promise.resolve({ ok: false, error: `${name} call cancelled` });
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = opts.maxBytes ?? MAX_OUTPUT_BYTES;
-  if (containsSecret(args)) return Promise.resolve({ ok: false, error: `refused: an argument looks like a credential; secrets never go on the ${name} command line` });
+  if (containsSecret(args, opts.extraSecretPatterns)) return Promise.resolve({ ok: false, error: `refused: an argument looks like a credential; secrets never go on the ${name} command line` });
   const srcEnv = opts.env ?? process.env;
   const env: NodeJS.ProcessEnv = {};
   for (const k of ENV_PASSTHROUGH) if (srcEnv[k] !== undefined) env[k] = srcEnv[k];

@@ -102,6 +102,17 @@ describe("runOrca", () => {
     expect(containsSecret(["--spec=fix the sk- prefix parser"])).toBe(false);
   });
 
+  it("an embedder can add its own credential shapes", async () => {
+    const f = fakeOrca({});
+    const plane = /plane_api_[A-Za-z0-9]{16,}/g;
+    const arg = "--text=token plane_api_" + "a".repeat(20);
+    expect(await runOrca(["terminal", "send", arg], { bin: f.bin, env: f.env, extraSecretPatterns: [plane] })).toMatchObject({ ok: false, error: expect.stringMatching(/^refused/) });
+    // A global regex keeps no lastIndex state between calls.
+    expect(containsSecret([arg], [plane])).toBe(true);
+    expect(containsSecret([arg], [plane])).toBe(true);
+    expect(() => f.calls()).toThrow();
+  });
+
   it("stdin stays off argv and a cancelled call stops", async () => {
     const f = fakeOrca({ computer: { stdout: { ok: true, result: {} }, sleepMs: 2000 } });
     const controller = new AbortController();
