@@ -726,7 +726,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     {
       name: "orca_check",
       description:
-        "With an agent's terminal: wait until that agent is done (as orca_terminal_wait), or peek at its output. With a run (orchestration): take the Run's worker messages (worker_done, questions) up to timeoutMs, or peek. Prefer orca_wait, which never takes mail.",
+        "With an agent's terminal: wait until that agent is done (as orca_terminal_wait), or peek at its output. With a run (orchestration): wait up to timeoutMs for unread worker messages (worker_done, questions), or with peek list them without waiting. Run mail is only ever read, never taken, so the Run's coordinator still gets it. For one event at a time prefer orca_wait.",
       shape: { run: handle.optional(), terminal: handle.optional(), peek: z.boolean().optional(), timeoutMs: z.number().int().min(1000).max(MAX_WAIT_MS).default(120_000) },
       handler: async (a: { run?: string | undefined; terminal?: string | undefined; peek?: boolean | undefined; timeoutMs: number }) => {
         if (a.terminal && !a.run) {
@@ -734,11 +734,11 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
           return waitTerminal(a.terminal, a.timeoutMs);
         }
         if (!(await orchestration())) return fail("Orca orchestration is disabled here: pass the agent's terminal to wait on");
-        const args = ["orchestration", "check"];
+        // Always --peek: a consuming check would take worker_done from whichever coordinator owns the Run.
+        const args = ["orchestration", "check", "--peek"];
         if (a.run) args.push(`--run=${a.run}`);
         if (a.terminal) args.push(`--terminal=${a.terminal}`);
-        if (a.peek) args.push("--peek");
-        else args.push("--wait", `--timeout-ms=${a.timeoutMs}`);
+        if (!a.peek) args.push("--wait", `--timeout-ms=${a.timeoutMs}`);
         args.push(...(await coord.fromArgs()));
         const r = await run(args, a.peek ? READ_MS : a.timeoutMs + 15_000);
         if (!r.ok) return fail(r.error);

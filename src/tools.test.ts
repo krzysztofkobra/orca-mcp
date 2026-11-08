@@ -288,7 +288,17 @@ describe("orca_terminal_wait (hook state)", () => {
     expect((await o.call("orca_check", { terminal: "term_1", timeoutMs: 300_000 })).state).toBe("done");
     expect(o.kinds().some((k) => k.startsWith("orchestration"))).toBe(false);
     await o.call("orca_check", { run: "run_1", terminal: "term_1", timeoutMs: 5000 });
-    expect(o.calls.at(-1)).toEqual(["orchestration", "check", "--run=run_1", "--terminal=term_1", "--wait", "--timeout-ms=5000"]);
+    expect(o.calls.at(-1)).toEqual(["orchestration", "check", "--peek", "--run=run_1", "--terminal=term_1", "--wait", "--timeout-ms=5000"]);
+  });
+
+  it("orca_check on a run never takes mail: every run check passes --peek", async () => {
+    const o = scripted({ "orchestration check": [{ ok: true, result: { messages: [{ id: "m1", type: "worker_done", from: "disp_1" }] } }] }, { orchestration: true });
+    expect((await o.call("orca_check", { run: "run_1", timeoutMs: 5000 })).state).toBe("done");
+    await o.call("orca_check", { run: "run_1", peek: true, timeoutMs: 5000 });
+    await o.call("orca_check", { run: "run_1", peek: false, timeoutMs: 5000 });
+    expect(o.calls).toHaveLength(3);
+    expect(o.calls.every((c) => c.includes("--peek"))).toBe(true);
+    expect(o.calls[1]).toEqual(["orchestration", "check", "--peek", "--run=run_1"]);
   });
 });
 
