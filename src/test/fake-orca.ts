@@ -31,8 +31,7 @@ export function fakeOrca(responses: Record<string, FakeReply | FakeReply[]>) {
 const fs = require("fs"), path = require("path");
 const home = process.env.HOME;
 const argv = process.argv.slice(2);
-const coord = Object.fromEntries(["ORCA_EXTERNAL_COORDINATOR", "ORCA_EXTERNAL_COORDINATOR_KEY"].filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
-fs.appendFileSync(path.join(home, "argv.log"), JSON.stringify({ argv, env: Object.keys(process.env).sort(), coord }) + "\\n");
+fs.appendFileSync(path.join(home, "argv.log"), JSON.stringify({ argv, env: Object.keys(process.env).sort() }) + "\\n");
 const r = JSON.parse(fs.readFileSync(path.join(home, "responses.json"), "utf8"));
 const name = argv.slice(0, 2).join(" ");
 let spec = r[name] ?? r[argv[0]] ?? { stdout: { ok: true, result: {} } };
@@ -60,7 +59,7 @@ spec.sleepMs ? setTimeout(done, spec.sleepMs) : done();
     readFileSync(join(home, "argv.log"), "utf8")
       .trim()
       .split("\n")
-      .map((l) => JSON.parse(l) as { argv: string[]; env: string[]; coord: Record<string, string> });
+      .map((l) => JSON.parse(l) as { argv: string[]; env: string[] });
   const setReplies = (more: Record<string, FakeReply | FakeReply[]>) => writeFileSync(join(home, "responses.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(home, "responses.json"), "utf8")), ...more }));
   return { home, bin, env, devRoot, calls, setReplies };
 }
@@ -88,7 +87,7 @@ export function fakeTools(f: ReturnType<typeof fakeOrca>, opts: { orchestration?
 }
 
 /** Orca replies by the first two argv words, in order; the last reply of each repeats. A clock that sleeps instantly. */
-export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestration?: boolean; caps?: string[]; deps?: Partial<ToolDeps> } = {}) {
+export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestration?: boolean; caps?: string[]; envExtra?: Record<string, string>; deps?: Partial<ToolDeps> } = {}) {
   const calls: string[][] = [];
   const queues = new Map(Object.entries(replies).map(([k, v]) => [k, [...v]]));
   let t = 1_000_000;
@@ -96,7 +95,7 @@ export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestr
   const list = buildTools({
     orchestration: async () => opts.orchestration ?? false,
     capabilities: async () => new Set(opts.caps ?? []),
-    env: { HOME: "/nowhere", ORCA_MCP_ROOTS: "/nowhere", ORCA_MCP_CLIENT: "tester" },
+    env: { HOME: "/nowhere", ORCA_MCP_ROOTS: "/nowhere", ORCA_MCP_CLIENT: "tester", ...opts.envExtra },
     run: async (args) => {
       calls.push(args);
       const q = queues.get(key(args));
@@ -107,7 +106,6 @@ export function scripted(replies: Record<string, OrcaResult[]>, opts: { orchestr
       t += ms;
     },
     pollMs: 5000,
-    coordinatorStore: null,
     ...opts.deps,
   });
   return {
