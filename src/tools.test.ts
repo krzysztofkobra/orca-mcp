@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { capabilityProbe, EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe } from "./capabilities.js";
 import { runOrca, type OrcaResult } from "./orca.js";
 import { ownerComment, ownerOf } from "./agent-state.js";
+import type { PushSource } from "./bridge.js";
 import { buildTools, type ToolResult } from "./tools.js";
 import { fakeOrca, fakeTools, scripted } from "./test/fake-orca.js";
 
@@ -604,6 +605,17 @@ describe("orca_agent_status", () => {
     expect(workers[1]).toMatchObject({ terminal: "term_2", state: "blocked", blockedOn: "apply_patch", dispatchId: "disp_9", taskId: "task_9", summary: "docs (codex) blocked for 30s on apply_patch" });
     expect(workers[2]).toMatchObject({ worktree: "/w/z", state: "idle", summary: "closed: no live agent" });
     expect(r.text).not.toContain("OWNER-PRIVATE");
+  });
+
+  it("the local plugin's pushed states apply only to the local Orca, never to a paired environment", async () => {
+    let overlays = 0;
+    const bridge: PushSource = { connected: () => true, seq: () => 0, overlay: (rows) => (overlays++, rows), changed: async () => false };
+    const replies: Record<string, OrcaResult[]> = { "worktree ps": [fleet], "terminal list": [terms], "orchestration worker-list": [{ ok: true, result: { workers: [] } }] };
+    await scripted(replies, { orchestration: true, deps: { bridge } }).call("orca_agent_status", {});
+    expect(overlays).toBe(1);
+    const paired = { orchestration: true, caps: [EXTERNAL_COORDINATOR_CAPABILITY], envExtra: { ORCA_MCP_ENVIRONMENT: "this-mac" }, deps: { bridge } };
+    expect((await scripted(replies, paired).call("orca_agent_status", {})).state).toBe("blocked");
+    expect(overlays).toBe(1);
   });
 
   it("scope all lists everyone's agents without their messages; a named dispatch uses worker-show for what it waits on", async () => {

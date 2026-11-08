@@ -273,11 +273,13 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
    * bridge's event count from before the read, so an event that lands during it still wakes the
    * next wait; `overlaid` says a pushed state replaced one ps reported.
    */
+  // The plugin reports the local Orca's panes; a paired environment may be another host.
+  const bridgeApplies = async () => !!deps.bridge?.connected() && (await coord.mode()).kind !== "external";
   type PsRead = OrcaResult & { pushed?: boolean; seq?: number; overlaid?: boolean };
   const readPs = async (signal?: AbortSignal): Promise<PsRead> => {
     const seq = deps.bridge?.seq();
     const ps = await run(["worktree", "ps"], 10_000, signal);
-    if (!ps.ok || !deps.bridge?.connected()) return { ...ps, ...(seq !== undefined ? { seq } : {}) };
+    if (!ps.ok || !deps.bridge || !(await bridgeApplies())) return { ...ps, ...(seq !== undefined ? { seq } : {}) };
     const worktrees = deps.bridge.overlay(psRows(ps.result));
     return { ok: true, result: { ...(ps.result as object), worktrees }, pushed: true, seq: seq ?? 0, overlaid: worktrees.some((r) => r.agents?.some((x) => x.pushed)) };
   };
@@ -288,7 +290,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
    */
   const nextRead = async (deadline: number, read: PsRead | undefined, signal?: AbortSignal) => {
     const ms = Math.max(0, deadline - now());
-    if (deps.bridge?.connected() && !read?.overlaid) await deps.bridge.changed(read?.seq ?? deps.bridge.seq(), Math.min(PUSH_SAFETY_MS, ms), signal);
+    if (deps.bridge && (await bridgeApplies()) && !read?.overlaid) await deps.bridge.changed(read?.seq ?? deps.bridge.seq(), Math.min(PUSH_SAFETY_MS, ms), signal);
     else await pause(Math.min(pollMs, ms), signal);
   };
 
