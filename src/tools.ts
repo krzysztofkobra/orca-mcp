@@ -448,13 +448,18 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       if (!r.ok && r.code === FENCED) return { kind: "event", commit: () => {}, result: fenced(runId, r) };
       if (!r.ok) return { kind: "failed", failed: r };
       const res = r.result as { messages?: MailMessage[]; timedOut?: boolean } | undefined;
-      const fresh = (res?.messages ?? []).filter((m) => m.id && !seenMail.has(m.id) && WAKE_TYPES.includes(m.type ?? "") && (!fromDispatch || m.from === fromDispatch || m.from === `dispatch:${fromDispatch}`));
+      // A worker's mail comes from its terminal handle; the dispatch it reports on is in the payload.
+      const dispatchOf = (m: MailMessage) => {
+        const p = m.payload as { dispatchId?: unknown } | undefined;
+        return typeof p?.dispatchId === "string" ? p.dispatchId : m.from?.replace(/^dispatch:/, "");
+      };
+      const fresh = (res?.messages ?? []).filter((m) => m.id && !seenMail.has(m.id) && WAKE_TYPES.includes(m.type ?? "") && (!fromDispatch || dispatchOf(m) === fromDispatch));
       const m = fresh[0];
       if (m) {
         const payload = m.payload as { outcome?: unknown; status?: unknown } | undefined;
         const failed = m.type === "worker_done" && (payload?.outcome === "failed" || payload?.status === "failed");
         const state = m.type === "worker_done" ? (failed ? "failed" : "done") : "blocked";
-        const dispatchId = m.from?.replace(/^dispatch:/, "");
+        const dispatchId = dispatchOf(m);
         const about = oneLine(m.subject || m.body || "", 160);
         return {
           kind: "event",

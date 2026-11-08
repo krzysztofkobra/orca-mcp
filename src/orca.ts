@@ -46,6 +46,8 @@ export interface OrcaOptions {
   env?: NodeJS.ProcessEnv;
   /** More credential shapes to refuse on argv, on top of the built-in ones (an embedder's own token formats). */
   extraSecretPatterns?: readonly RegExp[];
+  /** Variables set on the child on top of the passthrough list (an embedder's own, such as a screenshot dir). */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export type OrcaResult =
@@ -116,7 +118,12 @@ export function killAllOrcaChildren(sig: NodeJS.Signals = "SIGTERM"): number {
  * Never throws: every failure comes back as `{ ok: false, error }`.
  */
 export function runOrca(args: readonly string[], opts: OrcaOptions = {}): Promise<OrcaResult> {
-  return runJsonCli("orca", opts.bin ?? resolveOrcaBin(opts.env ?? process.env), args, opts, unwrapOrca);
+  const src = opts.env ?? process.env;
+  // A coordinator on the same computer as Orca saves its pairing in a profile of its own:
+  // Orca refuses to save a pairing code into the profile of the runtime it points at.
+  const profile = src.ORCA_MCP_CLIENT_PROFILE?.trim();
+  const withProfile = profile ? { ...opts, extraEnv: { ...opts.extraEnv, ORCA_USER_DATA_PATH: profile } } : opts;
+  return runJsonCli("orca", opts.bin ?? resolveOrcaBin(src), args, withProfile, unwrapOrca);
 }
 
 function unwrapOrca(parsed: unknown, code: number | null): OrcaResult {
@@ -139,6 +146,7 @@ export function runJsonCli(name: string, bin: string, args: readonly string[], o
   const srcEnv = opts.env ?? process.env;
   const env: NodeJS.ProcessEnv = {};
   for (const k of ENV_PASSTHROUGH) if (srcEnv[k] !== undefined) env[k] = srcEnv[k];
+  Object.assign(env, opts.extraEnv);
 
   return new Promise((resolve) => {
     let settled = false;

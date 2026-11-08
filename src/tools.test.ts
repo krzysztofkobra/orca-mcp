@@ -511,6 +511,24 @@ describe("orca_wait", () => {
     expect(o.kinds()).toContain("orchestration check");
   });
 
+  it("a dispatch's worker_done comes from the worker's terminal, with the dispatch in its payload (as live Orca sends it)", async () => {
+    const o = scripted(
+      {
+        "orchestration worker-show": [{ ok: true, result: { dispatchId: "disp_1", runId: "run_1", terminal: "term_1", state: "ready" } }],
+        "orchestration check": [{ ok: true, result: { messages: [
+          { id: "m0", type: "worker_done", from: "term_2", subject: "Other task done", payload: { dispatchId: "disp_2", outcome: "succeeded" } },
+          { id: "m1", type: "worker_done", from: "term_1", subject: "README line added", payload: { dispatchId: "disp_1", outcome: "succeeded" } },
+        ] } }],
+        "terminal list": [terms],
+        "worktree ps": [pane("working")],
+      },
+      { orchestration: true },
+    );
+    const r = await o.call("orca_wait", { dispatch: "disp_1", timeoutMs: 300_000 });
+    expect(r).toMatchObject({ state: "done", data: { via: "mail", event: { messageId: "m1", dispatchId: "disp_1" } } });
+    expect(r.summary).toBe("Worker disp_1 done: README line added");
+  });
+
   it("a dispatch with no terminal or worktree and an unreadable mailbox is unknown, never another worker's event", async () => {
     const o = scripted(
       {

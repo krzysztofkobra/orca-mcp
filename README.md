@@ -103,6 +103,7 @@ coordinator loop; copy it into your client's skills folder (for Claude Code:
 | `ORCA_MCP_ROOTS` | `~/dev` | Directories repos and worktrees must lie in, separated by `:` (`;` on Windows). Paths are resolved through symlinks and `..` before the check. |
 | `ORCA_MCP_CLIENT` | the MCP client's name plus a random per-process suffix | The owner tag written into worktrees this server starts (`orca-mcp:<tag>`). Without it each server process has its own tag, so "mine" does not survive a restart of the server; set a stable value (for example one per project or daemon) to find your workers again after a restart. |
 | `ORCA_MCP_ENVIRONMENT` | unset | Name (or id) of a saved Orca environment (`orca environment add`). When its Orca advertises `orchestration.external-coordinator.v1`, this server coordinates Runs as that paired device; see [External coordinators](#external-coordinators). Unset, everything works as before. |
+| `ORCA_MCP_CLIENT_PROFILE` | unset | A profile directory of the coordinator's own, passed to the orca CLI as `ORCA_USER_DATA_PATH`. Needed when `ORCA_MCP_ENVIRONMENT` points at the Orca on this same computer, where the pairing cannot be saved in Orca's own profile. |
 | `ORCA_MCP_BRIDGE` | on | `0` does not open the status socket for the companion plugin. |
 | `ORCA_MCP_TMP_PREFIX` | unset | Also allow scratch directories directly under the per-user temp dir whose name starts with this prefix. The directory must exist, be owned by you and be writable by nobody else. |
 
@@ -154,12 +155,17 @@ the paired device is the identity, there is no token of its own. It needs an Orc
 
 Setup (you do the pairing by hand, once; orca-mcp never pairs and stores nothing):
 
-1. In Orca, Settings, generate a pairing link for **This computer** (or run `orca pair` on
-   the host, which also opens network access).
-2. Save it as an environment:
-   `orca environment add --name this-mac --pairing-code "orca://pair?code=..."`
+1. Make a pairing link on the Orca host: `orca pair --address 127.0.0.1 --json` (its
+   `pairingUrl`) when the coordinator runs on the same computer, or `orca pair` / Settings for
+   another machine. `orca pair` also opens network access on that Orca.
+2. Save it as an environment. On the same computer Orca refuses to save a pairing code into the
+   profile of the runtime it points at, so the coordinator keeps a profile of its own:
+   `ORCA_USER_DATA_PATH=~/.orca-coordinator orca environment add --name this-mac --pairing-code "orca://pair?code=..."`
+   (on another machine plain `orca environment add ...` is enough).
 3. Set `ORCA_MCP_ENVIRONMENT=this-mac` in the server's environment (the `env` of your MCP
-   client config, as for `ORCA_MCP_ROOTS`).
+   client config, as for `ORCA_MCP_ROOTS`), and on the same computer also
+   `ORCA_MCP_CLIENT_PROFILE=~/.orca-coordinator` (orca-mcp passes it to the CLI as
+   `ORCA_USER_DATA_PATH`).
 
 `orca_status` then says `external coordinator on (environment this-mac)`. What changes:
 

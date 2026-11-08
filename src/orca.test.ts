@@ -18,6 +18,16 @@ describe("runOrca", () => {
     expect(c!.env).not.toContain("ORCA_TERMINAL_HANDLE");
   });
 
+  it("ORCA_MCP_CLIENT_PROFILE becomes the child's ORCA_USER_DATA_PATH; a parent's own profile never passes", async () => {
+    const f = fakeOrca({});
+    await runOrca(["status"], { bin: f.bin, env: { ...f.env, ORCA_USER_DATA_PATH: "/app/profile" } });
+    await runOrca(["status"], { bin: f.bin, env: { ...f.env, ORCA_MCP_CLIENT_PROFILE: "/coordinator/profile" } });
+    const [plain, profiled] = f.calls();
+    expect(plain!.env).not.toContain("ORCA_USER_DATA_PATH");
+    expect(profiled!.env).toContain("ORCA_USER_DATA_PATH");
+    expect(profiled!.env).not.toContain("ORCA_MCP_CLIENT_PROFILE");
+  });
+
   it("does not run a shell: metacharacters reach orca as literal argv", async () => {
     const f = fakeOrca({});
     await runOrca(["search", "--query=$(touch pwned); `id` | cat"], { bin: f.bin, env: f.env });
