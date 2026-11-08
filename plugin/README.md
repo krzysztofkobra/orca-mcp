@@ -13,8 +13,11 @@ process with your user's access, so Orca asks you to approve it before it loads.
 
 The socket dir comes from `os.tmpdir()` (`TMPDIR`) on both sides. Orca passes `TMPDIR` to plugin
 workers; an MCP client that starts orca-mcp with a different `TMPDIR` puts its socket where the
-plugin does not look, and that server keeps polling. On Windows the worker writes to named pipes
-`\\.\pipe\orca-mcp-<user>-<pid>` (best effort, untested).
+plugin does not look, and that server keeps polling.
+
+Windows: off on both sides. Named pipes live in one namespace shared by every user of the
+machine, so another user could create a matching pipe first and receive the events; the worker
+writes nothing there and orca-mcp polls.
 
 ## Develop
 

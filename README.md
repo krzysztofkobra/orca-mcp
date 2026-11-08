@@ -135,7 +135,8 @@ are refused before anything runs.
 (`<tmpdir>/orca-mcp-<uid>/<pid>.sock`, dir 0700, socket 0600). While it is connected, `orca_wait`
 wakes on those events instead of reading `orca worktree ps` every 5 s, and `orca_agent_status`
 says `via: "push"`. Without the plugin everything works by polling. Set `ORCA_MCP_BRIDGE=0` to
-not open the socket at all. Loading the plugin is your call: Orca shows what it may do and asks
+not open the socket at all. On Windows the bridge is off on both sides (named pipes are shared
+between users, so another user could squat one) and orca-mcp polls. Loading the plugin is your call: Orca shows what it may do and asks
 for approval (`orca plugin dev watch ./plugin`, see `plugin/README.md`).
 
 ## External coordinators

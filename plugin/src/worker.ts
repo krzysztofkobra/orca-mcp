@@ -4,26 +4,25 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import { lstatSync, readdirSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
-import { tmpdir, userInfo } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const EVENTS = ['agent.status.changed', 'workspace.created', 'workspace.removed'] as const
-const WINDOWS = process.platform === 'win32'
+// Off on Windows: the named pipe namespace is shared by every user, so another user could
+// create a matching pipe first and receive the events. orca-mcp polls there.
+const SUPPORTED = process.platform !== 'win32'
 // The server drops longer lines; skipping them here saves the write.
 const MAX_LINE_BYTES = 64 * 1024
 const VERSION = '0.1.0'
 
-const uid = () => process.getuid?.() ?? userInfo().uid
+const uid = () => process.getuid?.() ?? -1
 
 /** Where orca-mcp servers listen (must match orca-mcp's bridgeDir); tests point it elsewhere. */
-export const target = { dir: WINDOWS ? '\\\\.\\pipe\\' : join(tmpdir(), `orca-mcp-${uid()}`) }
+export const target = { dir: join(tmpdir(), `orca-mcp-${uid()}`) }
 
 function sockets(): string[] {
+  if (!SUPPORTED) return []
   try {
-    if (WINDOWS) {
-      const prefix = `orca-mcp-${userInfo().username}-`
-      return readdirSync(target.dir).filter((n) => n.startsWith(prefix)).map((n) => target.dir + n)
-    }
     const st = lstatSync(target.dir)
     // Only our own private dir: events never go to sockets another user could have planted.
     if (!st.isDirectory() || st.uid !== uid() || st.mode & 0o077) return []
