@@ -34,14 +34,23 @@ export function capabilityProbe(run: OrcaRunner): { get: () => Promise<ReadonlyS
   };
 }
 
-/** Whether `orca orchestration` works on this host (it is a togglable feature). Checked once per process. */
+/**
+ * Whether `orca orchestration` works on this host (it is a togglable feature).
+ * A success is cached for the process; a failure is not, since Orca may not be running yet.
+ */
 export function orchestrationProbe(run: OrcaRunner): () => Promise<boolean> {
   let cached: Promise<boolean> | null = null;
   return () => {
-    cached ??= run(["orchestration", "run-list", "--limit=1"], { timeoutMs: 10_000 }).then((r) => r.ok);
+    cached ??= run(["orchestration", "run-list", "--limit=1"], { timeoutMs: 10_000 }).then((r) => {
+      if (!r.ok) cached = null;
+      return r.ok;
+    });
     return cached;
   };
 }
+
+/** How long a failed external register keeps this process in legacy mode before it tries again. */
+export const REGISTER_RETRY_MS = 5 * 60_000;
 
 export type CoordinatorMode = { kind: "external"; id: string } | { kind: "legacy"; reason: string };
 
@@ -57,22 +66,27 @@ export interface CoordinatorAdapter {
  * coordinators, so a rename upstream changes only this adapter. Legacy mode is
  * today's behaviour: no identity flag, Orca resolves the caller as it always has.
  */
-export function coordinatorAdapter(run: OrcaRunner, capabilities: () => Promise<ReadonlySet<string>>, label: () => string): CoordinatorAdapter {
+export function coordinatorAdapter(run: OrcaRunner, capabilities: () => Promise<ReadonlySet<string>>, label: () => string, now: () => number = Date.now): CoordinatorAdapter {
   let registered: Promise<CoordinatorMode> | undefined;
+  let failed: { at: number; mode: CoordinatorMode } | undefined;
   const register = async (): Promise<CoordinatorMode> => {
     const caps = await capabilities();
     if (!caps.has(EXTERNAL_COORDINATOR_CAPABILITY)) return { kind: "legacy", reason: `runtime lacks ${EXTERNAL_COORDINATOR_CAPABILITY}` };
     const r: OrcaResult = await run(["orchestration", "external", "register", `--label=${label()}`], { timeoutMs: 15_000 });
     if (!r.ok) return { kind: "legacy", reason: `external register failed: ${r.error}` };
-    const res = r.result as { id?: unknown; externalId?: unknown; coordinator?: { id?: unknown } } | undefined;
-    const raw = [res?.id, res?.externalId, res?.coordinator?.id].find((v): v is string => typeof v === "string" && v.length > 0);
+    const res = r.result as { id?: unknown; coordinator?: { id?: unknown } } | undefined;
+    const raw = [res?.id, res?.coordinator?.id].find((v): v is string => typeof v === "string" && v.length > 0);
     if (!raw) return { kind: "legacy", reason: "external register returned no id" };
     return { kind: "external", id: raw.replace(/^external:/, "") };
   };
   const mode = () => {
+    if (failed && now() - failed.at < REGISTER_RETRY_MS) return Promise.resolve(failed.mode);
     registered ??= register().then((m) => {
-      // Retry a failed registration on the next call instead of pinning legacy mode for the whole process.
-      if (m.kind === "legacy") registered = undefined;
+      // A missing capability is re-read cheaply (the capability set is cached); a failed register waits out the retry window.
+      if (m.kind === "legacy") {
+        registered = undefined;
+        if (!m.reason.startsWith("runtime lacks")) failed = { at: now(), mode: m };
+      } else failed = undefined;
       return m;
     });
     return registered;

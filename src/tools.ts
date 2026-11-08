@@ -174,8 +174,8 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }));
   const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => runner(args, { ...o, env }));
   const client = () => clientLabel(env.ORCA_MCP_CLIENT?.trim() || deps.client?.() || undefined);
-  const coord = deps.coordinator ?? coordinatorAdapter((args, o) => runner(args, { ...o, env }), caps.get, client);
   const now = deps.now ?? Date.now;
+  const coord = deps.coordinator ?? coordinatorAdapter((args, o) => runner(args, { ...o, env }), caps.get, client, now);
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const pollMs = deps.pollMs ?? POLL_MS;
 

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { EXTERNAL_COORDINATOR_CAPABILITY } from "./capabilities.js";
+import { EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe, REGISTER_RETRY_MS } from "./capabilities.js";
 import type { OrcaResult } from "./orca.js";
 import { buildTools, type ToolResult } from "./tools.js";
 import { fakeOrca, fakeTools, scripted } from "./test/fake-orca.js";
@@ -411,13 +411,27 @@ describe("capability awareness", () => {
     expect(r.summary).toMatch(/stable Orca pane \(no external coordinator: runtime lacks orchestration\.external-coordinator\.v1; orca_worker_start with a spec creates its own Run\)/);
   });
 
-  it("a capability the runtime advertises but a register that fails falls back to legacy and retries next time", async () => {
+  it("a register that fails falls back to legacy, stays there for the retry window, then tries again", async () => {
     const o = scripted(
-      { "orchestration external register": [{ ok: false, error: "orca error: unknown command" }, { ok: true, result: { id: "ext_2" } }], "orchestration run-create": [{ ok: true, result: { runId: "run_9" } }] },
+      { "orchestration external register": [{ ok: false, error: "orca error: unknown command" }, { ok: true, result: { coordinator: { id: "ext_2" } } }], "orchestration run-create": [{ ok: true, result: { runId: "run_9" } }] },
       { orchestration: true, caps: [EXTERNAL_COORDINATOR_CAPABILITY] },
     );
     expect((await o.call("orca_run_create", { objective: "a" })).data.coordinator).toBe("legacy");
     expect(o.calls[1]).toEqual(["orchestration", "run-create", "--objective=a"]);
-    expect((await o.call("orca_run_create", { objective: "b" })).data.coordinator).toBe("external:ext_2");
+    expect((await o.call("orca_run_create", { objective: "b" })).data.coordinator).toBe("legacy");
+    expect(o.kinds().filter((k) => k === "orchestration external register")).toHaveLength(1);
+    o.at(1_000_000 + REGISTER_RETRY_MS);
+    expect((await o.call("orca_run_create", { objective: "c" })).data.coordinator).toBe("external:ext_2");
+    expect(o.kinds().filter((k) => k === "orchestration external register")).toHaveLength(2);
+  });
+
+  it("an orchestration probe failure is not cached, a success is", async () => {
+    let n = 0;
+    const replies: OrcaResult[] = [{ ok: false, error: "orca runtime not running" }, { ok: true, result: { runs: [] } }];
+    const probe = orchestrationProbe(async () => replies[Math.min(n++, 1)]!);
+    expect(await probe()).toBe(false);
+    expect(await probe()).toBe(true);
+    expect(await probe()).toBe(true);
+    expect(n).toBe(2);
   });
 });
