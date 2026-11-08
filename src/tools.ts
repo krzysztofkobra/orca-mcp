@@ -30,8 +30,9 @@ import { runOrca, type OrcaResult, type OrcaRunner } from "./orca.js";
  * Tool -> orca argv. Flags checked against `orca agent-context --json` and
  * `orca <cmd> --help` on CLI 1.4.250. Every value goes as `--flag=value`, so a
  * value starting with `-` can never be read as a flag of its own. `--json` is
- * appended by runOrca. `<env>` is `--environment=<ORCA_MCP_ENVIRONMENT>` when that saved
- * environment's runtime supports external coordinators (see capabilities.ts), else nothing.
+ * appended by runOrca. In external mode (ORCA_MCP_ENVIRONMENT names a saved environment whose
+ * runtime supports external coordinators, see capabilities.ts) every call below, the probes
+ * included, also ends in `--environment=<ORCA_MCP_ENVIRONMENT>`; that is added in one place, `run`.
  *
  * | tool                  | argv                                                                                         |
  * |-----------------------|----------------------------------------------------------------------------------------------|
@@ -44,19 +45,19 @@ import { runOrca, type OrcaResult, type OrcaRunner } from "./orca.js";
  * | orca_terminal_send    | terminal send --terminal= [--text=] [--enter] [--interrupt]                                  |
  * | orca_terminal_wait    | for=done: terminal show --terminal=, then worktree ps every pollMs (the pane's hook state)  |
  * |   for=exit|tui-idle   | terminal wait --terminal= --for=exit|tui-idle --timeout-ms=                                  |
- * | orca_run_create       | orchestration run-create --objective= [--external <env>]                                     |
- * | orca_task_create      | orchestration task-create --spec= [--task-title=] [--run=] [--deps=] <env>                   |
+ * | orca_run_create       | orchestration run-create --objective= [--external]                                           |
+ * | orca_task_create      | orchestration task-create --spec= [--task-title=] [--run=] [--deps=]                         |
  * | orca_worker_start     | orchestration worker-start (--task=|--spec=) --worktree=new-top-level --repo= --name= --agent= --comment= [--model= [--effort=]] [--run=] |
- * |   external            | worktree create --name= --repo= --no-parent --comment= <env>, then worker-start (--task=|--spec=) --worktree=id:<id> --agent= [--model= [--effort=]] [--run=] <env> |
+ * |   external            | worktree create --name= --repo= --no-parent --comment=, then worker-start (--task=|--spec=) --worktree=id:<id> --agent= [--model= [--effort=]] [--run=] |
  * |   no orchestration    | as orca_worktree_create with the spec as prompt                                              |
  * | orca_check            | with terminal (no run): as orca_terminal_wait for=done, or terminal read for peek            |
- * |   else                | orchestration check (--wait --timeout-ms=|--peek) [--run=] [--terminal=] <env>               |
+ * |   else                | orchestration check (--wait --timeout-ms=|--peek) [--run=] [--terminal=]                     |
  * | orca_agent_status     | worktree ps + terminal list [+ orchestration worker-list] [+ worker-show --dispatch=]        |
- * | orca_wait             | run known: orchestration check --run= --peek --wait --types=worker_done,escalation <env>     |
+ * | orca_wait             | run known: orchestration check --run= --peek --wait --types=worker_done,escalation           |
  * |   else                | worktree ps every pollMs (hook state of one terminal, one worktree, or every owned worker)  |
  * | orca_worker_read      | orchestration worker-read --dispatch= [--cursor=] [--limit=]  |  terminal read --terminal=   |
  * | orca_worker_stop      | orchestration worker-stop --dispatch=  |  terminal close --terminal=                         |
- * | orca_send             | orchestration send --to= --subject= [--body=] [--type=] [--run=] <env>  |  terminal send --text= --enter |
+ * | orca_send             | orchestration send --to= --subject= [--body=] [--type=] [--run=]  |  terminal send --text= --enter |
  * | orca_search           | search --query= [--limit=] [--scope=]                                                        |
  * | orca_worktree_rm      | worktree rm --worktree=path:<abs> [--force]                                                  |
  */
@@ -161,6 +162,8 @@ const PS_FAILS = 3;
 const WAKE_TYPES = ["worker_done", "escalation"];
 /** Orca's refusal once a Run's coordinator changed under a pending call (src/main/runtime/rpc/external-coordinator-invocation.ts). */
 const FENCED = "consumer_fenced";
+/** Our own code on a call refused because ORCA_MCP_ENVIRONMENT is set and its runtime cannot be read. */
+const UNAVAILABLE = "environment_unavailable";
 /** With a plugin pushing, `worktree ps` is still read this often in case an event was lost. */
 const PUSH_SAFETY_MS = 30_000;
 
@@ -194,13 +197,19 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
   const env = deps.env ?? process.env;
   const runner = deps.run ?? runOrca;
   const secrets = deps.extraSecretPatterns ? { extraSecretPatterns: deps.extraSecretPatterns } : {};
-  const run = (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => runner(args, { timeoutMs, env, ...secrets, ...(signal ? { signal } : {}) });
-  /** A coordinator call: in external mode it names the saved environment whose paired device coordinates. */
-  const runAs = async (args: string[], timeoutMs = READ_MS, signal?: AbortSignal) => run([...args, ...(await coord.args())], timeoutMs, signal);
+  /**
+   * Every orca call of the tools goes through here: in external mode it names the saved environment, so
+   * no call can reach local Orca while the paired one coordinates; with that environment unreachable it fails closed.
+   */
+  const run = async (args: string[], timeoutMs = READ_MS, signal?: AbortSignal): Promise<OrcaResult> => {
+    const m = await coord.mode();
+    if (m.kind === "unavailable") return { ok: false, error: m.reason, code: UNAVAILABLE };
+    return runner(m.kind === "external" ? [...args, `--environment=${m.environment}`] : args, { timeoutMs, env, ...secrets, ...(signal ? { signal } : {}) });
+  };
   const environment = env.ORCA_MCP_ENVIRONMENT?.trim() || undefined;
   // The capability that counts is the one of the runtime the saved environment reaches.
-  const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }), environment ? [`--environment=${environment}`] : []);
-  const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => runner(args, { ...o, env }));
+  const caps = deps.capabilities ? { get: deps.capabilities, seed: () => {} } : capabilityProbe((args, o) => runner(args, { ...o, env }), environment ? [`--environment=${environment}`] : [], deps.now);
+  const orchestration = deps.orchestration ?? orchestrationProbe((args, o) => run(args, o?.timeoutMs, o?.signal));
   const session = randomBytes(3).toString("hex");
   const client = () => {
     const fixed = env.ORCA_MCP_CLIENT?.trim();
@@ -431,7 +440,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
       const rest = Math.max(1000, deadline - now());
       const args = ["orchestration", "check", `--run=${runId}`, "--peek", `--types=${WAKE_TYPES.join(",")}`, ...(waitArgs ? ["--wait", `--timeout-ms=${rest}`] : [])];
-      const r = await runAs(args, waitArgs ? rest + 15_000 : READ_MS, signal);
+      const r = await run(args, waitArgs ? rest + 15_000 : READ_MS, signal);
       if (signal?.aborted) return { kind: "none", result: reply("cancelled", "Wait cancelled.") };
       // An event of its own, so the race with hook state ends now instead of at the timeout.
       if (!r.ok && r.code === FENCED) return { kind: "event", commit: () => {}, result: fenced(runId, r) };
@@ -493,14 +502,14 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     if ("error" in repo) return fail(repo.error);
     if (a.effort && !a.model) return fail("effort needs model");
     const owner = client();
-    const via = await coord.args();
+    const external = (await coord.mode()).kind === "external";
     const work = a.task ? `--task=${a.task}` : `--spec=${a.spec}`;
     let args = ["orchestration", "worker-start", work, "--worktree=new-top-level", `--repo=${repo.sel}`, `--name=${a.name}`, `--agent=${a.agent}`, `--comment=${ownerComment(owner, a.comment)}`];
     let created: string | undefined;
-    if (via.length) {
+    if (external) {
       // An external coordinator has no workspace of its own, so Orca refuses new-top-level and the
       // creation flags: the worktree (and its owner tag) comes first, on the same saved environment.
-      const wt = await run(["worktree", "create", `--name=${a.name}`, `--repo=${repo.sel}`, "--no-parent", `--comment=${ownerComment(owner, a.comment)}`, ...via], CREATE_MS);
+      const wt = await run(["worktree", "create", `--name=${a.name}`, `--repo=${repo.sel}`, "--no-parent", `--comment=${ownerComment(owner, a.comment)}`], CREATE_MS);
       if (!wt.ok) return fail(wt.error, wt.code ? { code: wt.code } : undefined);
       const id = pick(wt.result, ["worktree.id", "worktreeId"]);
       created = pick(wt.result, ["worktree.path", "path", "worktree.git.path"]);
@@ -510,9 +519,9 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     if (a.model) args.push(`--model=${a.model}`);
     if (a.effort) args.push(`--effort=${a.effort}`);
     if (a.run) args.push(`--run=${a.run}`);
-    const r = await run([...args, ...via], CREATE_MS);
+    const r = await run(args, CREATE_MS);
     if (!r.ok) {
-      const hint = r.code === "run_required" && via.length ? " Create one with orca_run_create first." : "";
+      const hint = r.code === "run_required" && external ? " Create one with orca_run_create first." : "";
       return fail(`${r.error}${hint}${created ? ` The worktree ${created} was created for it and is kept.` : ""}`, { ...(r.code ? { code: r.code } : {}), ...(created ? { worktree: created } : {}) });
     }
     const dispatch = pick(r.result, ["dispatchId", "dispatch.id", "dispatch_id", "id"]);
@@ -818,7 +827,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       handler: async (a: { objective: string }) => {
         if (!(await orchestration())) return fail("Orca orchestration is disabled here; use orca_worktree_create (worktree + agent) instead");
         const mode = await coord.mode();
-        const r = await run(["orchestration", "run-create", `--objective=${a.objective}`, ...(mode.kind === "external" ? ["--external", `--environment=${mode.environment}`] : [])]);
+        const r = await run(["orchestration", "run-create", `--objective=${a.objective}`, ...(mode.kind === "external" ? ["--external"] : [])]);
         const coordinator = mode.kind === "external" ? `environment:${mode.environment}` : "legacy";
         if (!r.ok) {
           const hint = mode.kind === "legacy" ? ` (no external coordinator: ${mode.reason}; orca_worker_start with a spec creates its own Run)` : "";
@@ -839,7 +848,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         if (a.title) args.push(`--task-title=${a.title}`);
         if (a.run) args.push(`--run=${a.run}`);
         if (a.deps?.length) args.push(`--deps=${JSON.stringify(a.deps)}`);
-        const r = await runAs(args);
+        const r = await run(args);
         if (!r.ok) return fail(r.error, r.code ? { code: r.code } : undefined);
         const taskId = pick(r.result, ["taskId", "task.id", "id"]);
         return ok(`Task ${taskId ?? "?"} created.`, { data: { taskId, result: r.result } });
@@ -883,7 +892,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         if (a.run) args.push(`--run=${a.run}`);
         if (a.terminal) args.push(`--terminal=${a.terminal}`);
         if (!a.peek) args.push("--wait", `--timeout-ms=${a.timeoutMs}`);
-        const r = await runAs(args, a.peek ? READ_MS : a.timeoutMs + 15_000);
+        const r = await run(args, a.peek ? READ_MS : a.timeoutMs + 15_000);
         if (!r.ok) return r.code === FENCED ? fenced(a.run, r) : fail(r.error);
         const res = r.result as { messages?: MailMessage[]; timedOut?: boolean };
         const msgs = res?.messages ?? [];
@@ -932,7 +941,7 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const args = ["orchestration", "send", `--to=${a.to}`, `--subject=${a.subject ?? a.body.slice(0, 80)}`, `--body=${a.body}`];
         if (a.type) args.push(`--type=${a.type}`);
         if (a.run) args.push(`--run=${a.run}`);
-        const r = await runAs(args);
+        const r = await run(args);
         return r.ok ? ok(`Sent to ${a.to}.`, { data: { result: r.result } }) : fail(r.error, r.code ? { code: r.code } : undefined);
       },
     },
@@ -975,7 +984,9 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
         const parsed = schema.safeParse(raw ?? {});
         if (!parsed.success) return fail(`invalid arguments for ${t.name}: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"} ${i.message}`).join("; ")}`);
         const args = parsed.data as never;
-        const r = await t.handler(args);
+        // Fail closed with the reason, before a handler reads the failed probe as "orchestration disabled".
+        const mode = await coord.mode();
+        const r = mode.kind === "unavailable" ? fail(mode.reason, { code: UNAVAILABLE, environment: mode.environment }) : await t.handler(args);
         return hook ? ((await hook(t.name, args, r)) ?? r) : r;
       },
     };

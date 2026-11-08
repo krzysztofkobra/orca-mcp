@@ -9,19 +9,29 @@ export function capabilitiesOf(status: unknown): string[] {
   return Array.isArray(caps) ? caps.filter((c): c is string => typeof c === "string") : [];
 }
 
+/** How long a failed capability read is reused before the next one: waits call often, a read can take 10 s. */
+export const FAILED_PROBE_MS = 30_000;
+
 /**
  * Reads the runtime's capabilities once (`status` plus `args`, e.g. the saved environment to ask).
- * A failed read is not cached: Orca may simply not be running yet when the server starts.
+ * `get` rejects when the read fails. A failure is kept for `FAILED_PROBE_MS` only: Orca may simply
+ * not be running yet when the server starts.
  */
-export function capabilityProbe(run: OrcaRunner, args: readonly string[] = []): { get: () => Promise<ReadonlySet<string>>; seed: (status: unknown) => void } {
+export function capabilityProbe(run: OrcaRunner, args: readonly string[] = [], now: () => number = Date.now): { get: () => Promise<ReadonlySet<string>>; seed: (status: unknown) => void } {
   let cached: ReadonlySet<string> | undefined;
+  let failed: { error: string; until: number } | undefined;
   let pending: Promise<ReadonlySet<string>> | undefined;
   return {
     get: () => {
       if (cached) return Promise.resolve(cached);
+      if (failed && now() < failed.until) return Promise.reject(new Error(failed.error));
       pending ??= run(["status", ...args], { timeoutMs: 10_000 }).then((r) => {
         pending = undefined;
-        if (!r.ok) return new Set<string>();
+        if (!r.ok) {
+          failed = { error: r.error, until: now() + FAILED_PROBE_MS };
+          throw new Error(r.error);
+        }
+        failed = undefined;
         cached = new Set(capabilitiesOf(r.result));
         return cached;
       });
@@ -49,13 +59,15 @@ export function orchestrationProbe(run: OrcaRunner): () => Promise<boolean> {
   };
 }
 
-export type CoordinatorMode = { kind: "external"; environment: string } | { kind: "legacy"; reason: string };
+export type CoordinatorMode =
+  | { kind: "external"; environment: string }
+  | { kind: "legacy"; reason: string }
+  /** ORCA_MCP_ENVIRONMENT is set but its runtime cannot be read: every call fails closed, none goes to local Orca. */
+  | { kind: "unavailable"; environment: string; reason: string };
 
 export interface CoordinatorAdapter {
-  /** How coordinator calls identify this server: as the paired device of a saved environment, or as today. */
+  /** How every orca call identifies this server: as the paired device of a saved environment, or as today. */
   mode(): Promise<CoordinatorMode>;
-  /** Extra argv of a coordinator call: `--environment=<name>` in external mode, nothing in legacy mode. */
-  args(): Promise<string[]>;
 }
 
 /**
@@ -63,22 +75,26 @@ export interface CoordinatorAdapter {
  * (stablyai/orca docs/site/content/docs/cli/orchestration.mdx "External coordinators",
  * src/cli/handlers/orchestration/run-handlers.ts), so a change upstream changes only this adapter.
  * The identity is a saved runtime environment the owner paired by hand (`orca environment add`);
- * every coordinator call passes `--environment=<name>` and Orca binds the Run to that paired
- * device. orca-mcp holds no credential of its own. Legacy mode is today's behaviour: Orca
+ * in external mode every orca call passes `--environment=<name>` and Orca binds the Run to that
+ * paired device. orca-mcp holds no credential of its own. Legacy mode is today's behaviour: Orca
  * resolves the caller as it always has.
  */
 export function coordinatorAdapter(capabilities: () => Promise<ReadonlySet<string>>, environment: string | undefined): CoordinatorAdapter {
-  const mode = async (): Promise<CoordinatorMode> => {
-    if (!environment) return { kind: "legacy", reason: "ORCA_MCP_ENVIRONMENT is not set" };
-    // Re-read until it succeeds: the capability set is cached once read.
-    const caps = await capabilities();
-    return caps.has(EXTERNAL_COORDINATOR_CAPABILITY) ? { kind: "external", environment } : { kind: "legacy", reason: `environment ${environment} lacks ${EXTERNAL_COORDINATOR_CAPABILITY} or is unreachable` };
-  };
+  // The first mode read from a successful probe holds for the process, so one session never
+  // switches between the paired environment and local Orca. Only a failed read is retried.
+  let settled: CoordinatorMode | undefined;
   return {
-    mode,
-    args: async () => {
-      const m = await mode();
-      return m.kind === "external" ? [`--environment=${m.environment}`] : [];
+    mode: async () => {
+      if (settled) return settled;
+      if (!environment) return (settled = { kind: "legacy", reason: "ORCA_MCP_ENVIRONMENT is not set" });
+      let caps: ReadonlySet<string>;
+      try {
+        caps = await capabilities();
+      } catch (err) {
+        return { kind: "unavailable", environment, reason: `Orca environment ${environment} (ORCA_MCP_ENVIRONMENT) cannot be reached: ${err instanceof Error ? err.message : String(err)}` };
+      }
+      settled ??= caps.has(EXTERNAL_COORDINATOR_CAPABILITY) ? { kind: "external", environment } : { kind: "legacy", reason: `environment ${environment} lacks ${EXTERNAL_COORDINATOR_CAPABILITY}` };
+      return settled;
     },
   };
 }

@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { capabilityProbe, EXTERNAL_COORDINATOR_CAPABILITY, orchestrationProbe } from "./capabilities.js";
-import type { OrcaResult } from "./orca.js";
+import { runOrca, type OrcaResult } from "./orca.js";
 import { ownerComment, ownerOf } from "./agent-state.js";
 import { buildTools, type ToolResult } from "./tools.js";
 import { fakeOrca, fakeTools, scripted } from "./test/fake-orca.js";
@@ -199,7 +199,7 @@ describe("external coordinator (paired environment) over the fake binary", () =>
     expect(argvOf("worktree create")).toEqual(["worktree", "create", "--name=w", `--repo=path:${join(f.devRoot, "repo")}`, "--no-parent", "--comment=orca-mcp:tester", "--environment=this-mac", "--json"]);
     expect(argvOf("orchestration worker-start")).toEqual(["orchestration", "worker-start", "--spec=s", "--worktree=id:repo1::/w/w", "--agent=claude", "--run=run_7", "--environment=this-mac", "--json"]);
     for (const cmd of ["orchestration task-create", "orchestration check", "orchestration send"]) expect(argvOf(cmd).at(-2)).toBe("--environment=this-mac");
-    expect(argvOf("worktree ps")).toEqual(["worktree", "ps", "--json"]);
+    expect(argvOf("worktree ps")).toEqual(["worktree", "ps", "--environment=this-mac", "--json"]);
     // The environment travels only on argv: none of the parent's environment selectors reach the child.
     for (const c of calls) for (const k of ["ORCA_MCP_ENVIRONMENT", "ORCA_ENVIRONMENT", "ORCA_PAIRING_CODE"]) expect(c.env).not.toContain(k);
   });
@@ -227,6 +227,80 @@ describe("external coordinator (paired environment) over the fake binary", () =>
     await o.call("orca_wait", { timeoutMs: 1000 });
     expect(o.kinds().filter((k) => k === "orchestration check")).toHaveLength(checks);
     expect(await o.call("orca_check", { run: "run_5", timeoutMs: 1000 })).toMatchObject({ state: "fenced", isError: false });
+  });
+
+  it("every orca call of every tool, probes included, names the saved environment", async () => {
+    const f = fakeOrca({
+      status: { stdout: { ok: true, result: { app: { running: true }, runtime: { state: "ready", reachable: true, capabilities: [EXTERNAL_COORDINATOR_CAPABILITY] } } } },
+      "worktree create": { stdout: { ok: true, result: { agentTerminalHandle: "term_1", worktree: { id: "repo1::/w/w", path: "/w/w" } } } },
+      "orchestration check": { stdout: { ok: true, result: { messages: [{ id: "m1", type: "worker_done", from: "disp_1" }] } } },
+    });
+    const env = { ...f.env, ORCA_MCP_ENVIRONMENT: "this-mac" };
+    let t = 1_000_000;
+    // The real capability and orchestration probes, so their calls are checked too.
+    const list = buildTools({ env, run: (args, o) => runOrca(args, { ...o, bin: f.bin, env }), now: () => t, sleep: async (ms) => void (t += ms) });
+    const repo = join(f.devRoot, "repo");
+    const calls: [string, Record<string, unknown>][] = [
+      ["orca_status", {}],
+      ["orca_repos", {}],
+      ["orca_repo_add", { path: repo }],
+      ["orca_worktrees", {}],
+      ["orca_worktree_create", { repo, name: "a", agent: "claude", prompt: "p" }],
+      ["orca_terminal_read", { terminal: "term_1" }],
+      ["orca_terminal_send", { terminal: "term_1", text: "hi", enter: true }],
+      ["orca_terminal_wait", { terminal: "term_1", for: "done", timeoutMs: 1000 }],
+      ["orca_terminal_wait", { terminal: "term_1", for: "exit", timeoutMs: 1000 }],
+      ["orca_agent_status", { dispatch: "disp_1" }],
+      ["orca_run_create", { objective: "o" }],
+      ["orca_task_create", { spec: "t", run: "run_1" }],
+      ["orca_worker_start", { repo, name: "w", spec: "s", run: "run_1" }],
+      ["orca_wait", { run: "run_1", terminal: "term_1", timeoutMs: 1000 }],
+      ["orca_wait", { worktree: repo, timeoutMs: 1000 }],
+      ["orca_check", { run: "run_1", peek: true }],
+      ["orca_check", { terminal: "term_1", timeoutMs: 1000 }],
+      ["orca_worker_read", { dispatch: "disp_1" }],
+      ["orca_worker_read", { terminal: "term_1" }],
+      ["orca_worker_stop", { dispatch: "disp_1" }],
+      ["orca_worker_stop", { terminal: "term_1" }],
+      ["orca_send", { to: "dispatch:disp_1", body: "b" }],
+      ["orca_send", { terminal: "term_1", body: "b" }],
+      ["orca_search", { query: "q" }],
+      ["orca_worktree_rm", { worktree: "/elsewhere/x" }],
+      ["orca_worktree_rm", { worktree: repo }],
+    ];
+    // A new tool must be added here, so it cannot escape the check.
+    expect(new Set(calls.map(([n]) => n))).toEqual(new Set(list.map((x) => x.name)));
+    for (const [n, args] of calls) await (list.find((x) => x.name === n)!.handler as (a: unknown) => Promise<ToolResult>)(args);
+    const spawned = f.calls().map((c) => c.argv);
+    expect(spawned.filter((a) => !a.includes("--environment=this-mac"))).toEqual([]);
+    const kinds = new Set(spawned.map((a) => a.slice(0, 2).join(" ")));
+    for (const k of ["orchestration run-list", "worktree ps", "terminal list", "terminal show", "terminal wait", "orchestration worker-list", "orchestration worker-show", "orchestration worker-read", "orchestration worker-stop", "terminal close", "worktree list", "repo list", "worktree rm", "search --query=q"]) expect(kinds).toContain(k);
+  });
+
+  it("an unreachable environment fails every tool closed, rereads it only after 30 s, and never falls back to local Orca", async () => {
+    const o = scripted(
+      { "status --environment=this-mac": [{ ok: false, error: "orca error: Unknown Orca server in --environment this-mac" }, { ok: true, result: { runtime: { capabilities: [EXTERNAL_COORDINATOR_CAPABILITY] } } }] },
+      { orchestration: true, envExtra: { ORCA_MCP_ENVIRONMENT: "this-mac" }, deps: { capabilities: undefined } },
+    );
+    for (const n of ["orca_status", "orca_worktrees", "orca_agent_status", "orca_run_create", "orca_wait"]) {
+      const r = await o.call(n, n === "orca_run_create" ? { objective: "x" } : {});
+      expect(r).toMatchObject({ isError: true, data: { code: "environment_unavailable", environment: "this-mac" } });
+      expect(r.summary).toBe("Orca environment this-mac (ORCA_MCP_ENVIRONMENT) cannot be reached: orca error: Unknown Orca server in --environment this-mac");
+    }
+    expect(o.kinds()).toEqual(["status --environment=this-mac"]);
+    o.at(1_000_000 + 30_000);
+    expect((await o.call("orca_worktrees", {})).isError).toBe(false);
+    expect(o.calls.slice(1)).toEqual([["status", "--environment=this-mac"], ["worktree", "ps", "--environment=this-mac"]]);
+  });
+
+  it("a mode read from a successful probe holds for the session", async () => {
+    let caps: string[] = [];
+    const o = scripted({ "orchestration run-create": [{ ok: true, result: { run: { id: "run_9" } } }] }, { orchestration: true, envExtra: { ORCA_MCP_ENVIRONMENT: "this-mac" }, deps: { capabilities: async () => new Set(caps) } });
+    expect((await o.call("orca_run_create", { objective: "a" })).data.coordinator).toBe("legacy");
+    caps = [EXTERNAL_COORDINATOR_CAPABILITY];
+    expect((await o.call("orca_run_create", { objective: "b" })).data.coordinator).toBe("legacy");
+    await o.call("orca_worktrees", {});
+    expect(o.calls.flat().some((a) => a.startsWith("--environment") || a === "--external")).toBe(false);
   });
 
   it("orca_status says which environment coordinates, and the capability probe asks that environment", async () => {
@@ -585,7 +659,7 @@ describe("capability awareness", () => {
     expect(r.isError).toBe(true);
     expect(r.summary).toMatch(/stable Orca pane \(no external coordinator: ORCA_MCP_ENVIRONMENT is not set; orca_worker_start with a spec creates its own Run\)/);
     const lacking = await scripted({ "orchestration run-create": [{ ok: false, error: "orca error: needs a pane", code: "stable_pane_required" }] }, { orchestration: true, envExtra: { ORCA_MCP_ENVIRONMENT: "this-mac" } }).call("orca_run_create", { objective: "x" });
-    expect(lacking.summary).toMatch(/no external coordinator: environment this-mac lacks orchestration\.external-coordinator\.v1 or is unreachable/);
+    expect(lacking.summary).toMatch(/no external coordinator: environment this-mac lacks orchestration\.external-coordinator\.v1;/);
   });
 
   it("an orchestration probe failure is not cached, a success is", async () => {
