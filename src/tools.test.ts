@@ -134,6 +134,64 @@ describe("tools over the fake binary", () => {
     expect(f.calls()[0]!.argv).toEqual(["terminal", "read", "--terminal=term_1", "--cursor=10", "--json"]);
   });
 
+  it("tail reads only the last lines and is not combined with paging", async () => {
+    const f = fakeOrca({ "terminal read": { stdout: { ok: true, result: { tail: ["a", "b", "c", "d"] } } } });
+    const { call } = fakeTools(f);
+    const r = await call("orca_terminal_read", { terminal: "term_1", tail: 2 });
+    expect(r.text).toBe("ok: Read 2 lines from terminal term_1.\nc\nd");
+    expect(f.calls()[0]!.argv).toEqual(["terminal", "read", "--terminal=term_1", "--limit=2", "--json"]);
+    expect((await call("orca_terminal_read", { terminal: "term_1", tail: 2, cursor: 1 })).isError).toBe(true);
+    expect((await call("orca_terminal_read", { terminal: "term_1", tail: 2, limit: 5 })).isError).toBe(true);
+    expect(f.calls().length).toBe(1);
+  });
+
+  it("orca_terminals filters by worktree path on a boundary, by name text and by agent", async () => {
+    const f = fakeOrca({});
+    const foo = join(f.devRoot, "foo");
+    const terminals = [
+      { handle: "term_a", worktreePath: foo, branch: "refs/heads/main", title: "otter-round", agentIdentity: "claude", connected: true, tabId: "t1" },
+      { handle: "term_b", worktreePath: join(foo, "wt"), branch: "refs/heads/fix-x", title: "fix", agentIdentity: "codex", connected: false, tabId: "t2" },
+      { handle: "term_c", worktreePath: join(f.devRoot, "foobar"), branch: "refs/heads/y", title: "shell" },
+    ];
+    f.setReplies({ "terminal list": { stdout: { ok: true, result: { terminals } } } });
+    const { call } = fakeTools(f);
+    const byPath = await call("orca_terminals", { worktree: foo });
+    expect((byPath.data.terminals as { handle: string }[]).map((t) => t.handle)).toEqual(["term_a", "term_b"]);
+    expect(byPath.text).toContain(`- term_b ${join(foo, "wt")} [fix-x] "fix" agent=codex disconnected`);
+    expect((await call("orca_terminals", { worktree: "FIX-x" })).data.terminals).toMatchObject([{ handle: "term_b", branch: "fix-x" }]);
+    expect((await call("orca_terminals", { agent: "claude" })).data.terminals).toMatchObject([{ handle: "term_a", tab: "t1", connected: true }]);
+    expect((await call("orca_terminals", { agent: "opencode" })).summary).toBe("No matching terminals.");
+    expect(f.calls().every((c) => c.argv.join(" ") === "terminal list --json")).toBe(true);
+  });
+
+  it("orca_terminal_close closes one terminal, its tab, or all of a worktree only with all", async () => {
+    const f = fakeOrca({});
+    const { call } = fakeTools(f);
+    expect(await call("orca_terminal_close", { terminal: "term_1" })).toMatchObject({ state: "stopped", data: { stopped: { key: "term:term_1" } } });
+    expect((await call("orca_terminal_close", { terminal: "term_2", tab: true })).summary).toBe("Closed terminal term_2 and its tab.");
+    const wt = join(f.devRoot, "repo");
+    expect((await call("orca_terminal_close", { worktree: wt, all: true })).data.stopped).toEqual({ worktree: wt });
+    expect(f.calls().map((c) => c.argv)).toEqual([
+      ["terminal", "close", "--terminal=term_1", "--json"],
+      ["terminal", "close", "--terminal=term_2", "--tab", "--json"],
+      ["terminal", "close", `--worktree=path:${wt}`, "--all", "--json"],
+    ]);
+    for (const bad of [{}, { terminal: "term_1", worktree: wt, all: true }, { worktree: wt }, { terminal: "term_1", all: true }, { worktree: wt, all: true, tab: true }, { worktree: "/etc", all: true }]) {
+      expect((await call("orca_terminal_close", bad)).isError, JSON.stringify(bad)).toBe(true);
+    }
+    expect(f.calls().filter((c) => c.argv[1] === "close").length).toBe(3);
+  });
+
+  it("orca_worktree_show returns the worktree's facts and owner", async () => {
+    const f = fakeOrca({
+      "worktree show": { stdout: { ok: true, result: { worktree: { id: "r::/w/x", path: "/w/x", branch: "refs/heads/fix-x", head: "abcdef1234", displayName: "fix-x", comment: "note orca-mcp:tester", workspaceStatus: "in-progress", isMainWorktree: false } } } },
+    });
+    const r = await fakeTools(f).call("orca_worktree_show", { worktree: "/w/x" });
+    expect(r.summary).toBe("Worktree /w/x [fix-x] at abcdef1, in-progress, owner=tester.");
+    expect(r.data.worktree).toMatchObject({ path: "/w/x", branch: "fix-x", head: "abcdef1234", owner: "tester", main: false });
+    expect(f.calls()[0]!.argv).toEqual(["worktree", "show", "--worktree=path:/w/x", "--json"]);
+  });
+
   it("orca_status reports version and capabilities in one line", async () => {
     const f = fakeOrca({ status: { stdout: { ok: true, result: { app: { running: true }, runtime: { state: "ready", reachable: true, appVersion: "1.4.250", capabilities: ["orchestration.contract.v1"] } } } } });
     const r = await fakeTools(f, { orchestration: true }).call("orca_status", {});
@@ -249,6 +307,10 @@ describe("external coordinator (paired environment) over the fake binary", () =>
       ["orca_worktrees", {}],
       ["orca_worktree_create", { repo, name: "a", agent: "claude", prompt: "p" }],
       ["orca_terminal_read", { terminal: "term_1" }],
+      ["orca_terminals", { worktree: repo }],
+      ["orca_terminal_close", { terminal: "term_1", tab: true }],
+      ["orca_terminal_close", { worktree: repo, all: true }],
+      ["orca_worktree_show", { worktree: repo }],
       ["orca_terminal_send", { terminal: "term_1", text: "hi", enter: true }],
       ["orca_terminal_wait", { terminal: "term_1", for: "done", timeoutMs: 1000 }],
       ["orca_terminal_wait", { terminal: "term_1", for: "exit", timeoutMs: 1000 }],
@@ -276,7 +338,7 @@ describe("external coordinator (paired environment) over the fake binary", () =>
     const spawned = f.calls().map((c) => c.argv);
     expect(spawned.filter((a) => !a.includes("--environment=this-mac"))).toEqual([]);
     const kinds = new Set(spawned.map((a) => a.slice(0, 2).join(" ")));
-    for (const k of ["orchestration run-list", "worktree ps", "terminal list", "terminal show", "terminal wait", "orchestration worker-list", "orchestration worker-show", "orchestration worker-read", "orchestration worker-stop", "terminal close", "worktree list", "repo list", "worktree rm", "search --query=q"]) expect(kinds).toContain(k);
+    for (const k of ["orchestration run-list", "worktree ps", "worktree show", "terminal list", "terminal show", "terminal wait", "orchestration worker-list", "orchestration worker-show", "orchestration worker-read", "orchestration worker-stop", "terminal close", "worktree list", "repo list", "worktree rm", "search --query=q"]) expect(kinds).toContain(k);
   });
 
   it("an unreachable environment fails every tool closed, rereads it only after 30 s, and never falls back to local Orca", async () => {

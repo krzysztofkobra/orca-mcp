@@ -40,8 +40,11 @@ import { runOrca, type OrcaResult, type OrcaRunner } from "./orca.js";
  * | orca_repos            | repo list                                                                                    |
  * | orca_repo_add         | repo add --path=<abs>                                                                        |
  * | orca_worktrees        | worktree ps [--limit=<n>]                                                                    |
+ * | orca_worktree_show    | worktree show --worktree=path:<abs>                                                          |
  * | orca_worktree_create  | worktree create --name= --repo=path:<abs> --agent= --prompt= --no-parent --comment=orca-mcp:<client> [--model=] [--effort=] [--base-branch=] |
- * | orca_terminal_read    | terminal read --terminal= [--cursor=] [--limit=] [--screen]                                  |
+ * | orca_terminals        | terminal list [--limit=]  (worktree, name and agent filtered here)                           |
+ * | orca_terminal_read    | terminal read --terminal= [--cursor=] [--limit=] [--screen]   (tail=<n>: --limit=<n>)        |
+ * | orca_terminal_close   | terminal close --terminal= [--tab]  |  terminal close --worktree=path:<abs> --all            |
  * | orca_terminal_send    | terminal send --terminal= [--text=] [--enter] [--interrupt]                                  |
  * | orca_terminal_wait    | for=done: terminal show --terminal=, then worktree ps every pollMs (the pane's hook state)  |
  * |   for=exit|tui-idle   | terminal wait --terminal= --for=exit|tui-idle --timeout-ms=                                  |
@@ -688,6 +691,47 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
       },
     },
     {
+      name: "orca_worktree_show",
+      description: "One worktree's details: path, branch, head commit, display name, status, owner tag and comment, main or linked, parent, last activity.",
+      shape: { worktree: absPath },
+      handler: async (a: { worktree: string }) => {
+        const r = await run(["worktree", "show", `--worktree=path:${a.worktree.trim()}`]);
+        if (!r.ok) return fail(r.error);
+        const w = ((r.result as { worktree?: unknown })?.worktree ?? {}) as {
+          id?: string;
+          path?: string;
+          branch?: string;
+          head?: string;
+          displayName?: string;
+          comment?: unknown;
+          workspaceStatus?: string;
+          isMainWorktree?: boolean;
+          parentWorktreeId?: string | null;
+          lastActivityAt?: number;
+          linkedPR?: unknown;
+        };
+        const branch = stripRef(w.branch);
+        const owner = ownerOf(w.comment);
+        const comment = typeof w.comment === "string" && w.comment ? w.comment.slice(0, 500) : undefined;
+        const info = {
+          id: w.id,
+          path: w.path,
+          branch,
+          head: w.head,
+          name: w.displayName,
+          status: w.workspaceStatus,
+          owner,
+          comment,
+          main: w.isMainWorktree === true,
+          ...(w.parentWorktreeId ? { parent: w.parentWorktreeId } : {}),
+          ...(typeof w.lastActivityAt === "number" ? { lastActivityAt: w.lastActivityAt } : {}),
+          ...(w.linkedPR ? { linkedPR: w.linkedPR } : {}),
+        };
+        const head = `Worktree ${w.path ?? a.worktree} [${branch ?? "?"}]${w.head ? ` at ${w.head.slice(0, 7)}` : ""}${w.workspaceStatus ? `, ${w.workspaceStatus}` : ""}${info.main ? ", main worktree" : ""}${owner ? `, owner=${owner}` : ""}.`;
+        return ok(head, { details: comment ? `Comment: ${comment}` : undefined, data: { worktree: info } });
+      },
+    },
+    {
       name: "orca_worktree_create",
       description:
         "Create a new worktree in a repo and start a coding agent in it with the task prompt (optional model and effort). The worktree is tagged as this client's, so orca_agent_status and orca_wait find it after a restart. Returns the agent's terminal handle.",
@@ -705,15 +749,83 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
     },
     {
       name: "orca_terminal_read",
-      description: "Read an agent terminal's output (stripped of escapes). Use cursor from the previous read to get only new output; screen=true for the rendered screen.",
-      shape: { terminal: handle, cursor: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(2000).optional(), screen: z.boolean().optional() },
-      handler: async (a: { terminal: string; cursor?: number | undefined; limit?: number | undefined; screen?: boolean | undefined }) => {
+      description:
+        "Read an agent terminal's output (stripped of escapes). tail=n for only its last n lines; cursor from the previous read for only new output (limit caps the lines per page); screen=true for the rendered screen.",
+      shape: {
+        terminal: handle,
+        cursor: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(2000).optional(),
+        tail: z.number().int().min(1).max(2000).optional().describe("Only the last n lines"),
+        screen: z.boolean().optional(),
+      },
+      handler: async (a: { terminal: string; cursor?: number | undefined; limit?: number | undefined; tail?: number | undefined; screen?: boolean | undefined }) => {
         if (a.screen && a.cursor !== undefined) return fail("screen and cursor cannot be combined");
+        if (a.tail !== undefined && (a.cursor !== undefined || a.limit !== undefined)) return fail("tail cannot be combined with cursor or limit");
         const args = ["terminal", "read", `--terminal=${a.terminal}`];
         if (a.cursor !== undefined) args.push(`--cursor=${a.cursor}`);
-        if (a.limit) args.push(`--limit=${a.limit}`);
+        // Without a cursor Orca returns the tail preview, `--limit` lines long.
+        const limit = a.tail ?? a.limit;
+        if (limit) args.push(`--limit=${limit}`);
         if (a.screen) args.push("--screen");
-        return readResult(await run(args), `terminal ${a.terminal}`);
+        return readResult(await run(args), `terminal ${a.terminal}`, a.tail);
+      },
+    },
+    {
+      name: "orca_terminals",
+      description:
+        "Live Orca terminals: handle, worktree, branch, title, agent, connected, last output. Filter by worktree (an absolute path: that worktree and below; other text is matched against the worktree path, branch and title) and by agent (claude, codex, ...).",
+      shape: { worktree: z.string().min(1).max(1024).optional(), agent: agent.optional(), limit: z.number().int().min(1).max(500).optional() },
+      handler: async (a: { worktree?: string | undefined; agent?: string | undefined; limit?: number | undefined }) => {
+        const r = await run(["terminal", "list", ...(a.limit ? [`--limit=${a.limit}`] : [])]);
+        if (!r.ok) return fail(r.error);
+        type Row = { handle?: string; worktreePath?: string; branch?: string; title?: string; agentIdentity?: string; connected?: boolean; orphaned?: boolean; lastOutputAt?: number; tabId?: string };
+        let rows = ((r.result as { terminals?: Row[] })?.terminals ?? []).filter((t) => t.handle);
+        const want = a.worktree?.trim();
+        if (want) {
+          const needle = want.toLowerCase();
+          rows = rows.filter((t) =>
+            want.startsWith("/") ? !!t.worktreePath && underPath(t.worktreePath, want) : [t.worktreePath, stripRef(t.branch), t.title].some((v) => !!v && v.toLowerCase().includes(needle)),
+          );
+        }
+        if (a.agent) rows = rows.filter((t) => t.agentIdentity === a.agent);
+        const list = rows.map((t) => ({
+          handle: t.handle!,
+          worktree: t.worktreePath,
+          branch: stripRef(t.branch),
+          title: t.title,
+          agent: t.agentIdentity,
+          connected: t.connected !== false && t.orphaned !== true,
+          tab: t.tabId,
+          ...(typeof t.lastOutputAt === "number" ? { lastOutputAt: t.lastOutputAt } : {}),
+        }));
+        if (!list.length) return ok("No matching terminals.", { data: { terminals: [] } });
+        const details = list
+          .map((t) => `- ${t.handle} ${t.worktree ?? "?"} [${t.branch ?? "?"}]${t.title ? ` "${oneLine(t.title, 80)}"` : ""}${t.agent ? ` agent=${t.agent}` : ""}${t.connected ? "" : " disconnected"}`)
+          .join("\n");
+        return ok(`${list.length} terminal${list.length === 1 ? "" : "s"}.`, { details, data: { terminals: list } });
+      },
+    },
+    {
+      name: "orca_terminal_close",
+      description:
+        "Close one terminal (by handle; tab=true closes its whole tab), or every terminal of a worktree (worktree path plus all=true). The agent running there ends. Never deletes the worktree.",
+      shape: { terminal: handle.optional(), tab: z.boolean().optional(), worktree: absPath.optional(), all: z.boolean().optional() },
+      handler: async (a: { terminal?: string | undefined; tab?: boolean | undefined; worktree?: string | undefined; all?: boolean | undefined }) => {
+        if (!a.terminal === !a.worktree) return fail("give exactly one of terminal or worktree");
+        if (a.terminal) {
+          if (a.all) return fail("all goes with worktree, not terminal");
+          const r = await run(["terminal", "close", `--terminal=${a.terminal}`, ...(a.tab ? ["--tab"] : [])]);
+          if (!r.ok) return fail(r.error);
+          return reply("stopped", `Closed terminal ${a.terminal}${a.tab ? " and its tab" : ""}.`, { data: { stopped: { key: `term:${a.terminal}` } } });
+        }
+        // Explicit, so a worktree path alone never closes every terminal in it.
+        if (a.all !== true) return fail("closing every terminal of a worktree needs all: true");
+        if (a.tab) return fail("tab goes with terminal, not worktree");
+        const wt = await worktreeSel(a.worktree!);
+        if ("error" in wt) return fail(wt.error);
+        const r = await run(["terminal", "close", `--worktree=${wt.sel}`, "--all"]);
+        if (!r.ok) return fail(r.error);
+        return reply("stopped", `Closed every terminal of worktree ${wt.path}.`, { data: { stopped: { worktree: wt.path } } });
       },
     },
     {
@@ -1009,12 +1121,14 @@ export function buildTools(deps: ToolDeps = {}): ToolDef[] {
 }
 
 /** Terminal/worker output as plain text plus the cursor for the next read. */
-function readResult(r: OrcaResult, what: string): ToolResult {
+function readResult(r: OrcaResult, what: string, tail?: number): ToolResult {
   if (!r.ok) return fail(r.error);
   const v = r.result as { tail?: unknown; output?: unknown; lines?: unknown; text?: unknown; nextCursor?: unknown };
   const body = [v?.tail, v?.output, v?.text, v?.lines].find((x) => typeof x === "string" || Array.isArray(x));
   if (body === undefined) return ok(`Read ${what}.`, { details: compact(r.result), data: { result: r.result } });
-  const textOut = Array.isArray(body) ? body.map((l) => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") : (body as string);
+  const all = Array.isArray(body) ? body.map((l) => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") : (body as string);
+  // A screen read or an older host may return more lines than asked for.
+  const textOut = tail ? all.split("\n").slice(-tail).join("\n") : all;
   const cut = textOut.length > 20_000 ? `[earlier output cut]\n${textOut.slice(-20_000)}` : textOut;
   const lines = textOut ? textOut.split("\n").length : 0;
   const cursor = v.nextCursor !== undefined ? String(v.nextCursor) : undefined;

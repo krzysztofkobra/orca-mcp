@@ -116,7 +116,10 @@ are refused before anything runs.
 | `orca_run_create`, `orca_task_create` | Orchestration Run and Task. |
 | `orca_send` | Orchestration mail to a worker or Run, or a line typed into its terminal. |
 | `orca_check` | List or wait for a Run's unread mail (always read with `--peek`, never taken), or wait on one terminal. Prefer `orca_wait`. |
-| `orca_worker_read`, `orca_terminal_read` | A worker's output, by dispatch or terminal, with cursors. |
+| `orca_worktree_show` | One worktree's details: branch, head, status, owner tag. |
+| `orca_worker_read`, `orca_terminal_read` | A worker's output, by dispatch or terminal, with cursors; `tail` on a terminal for its last lines. |
+| `orca_terminals` | Live terminals, filtered by worktree (path or name) and agent. |
+| `orca_terminal_close` | Close one terminal, its tab, or every terminal of a worktree (`all: true`). |
 | `orca_terminal_send`, `orca_terminal_wait` | Low-level terminal input and waits. |
 | `orca_worker_stop`, `orca_worktree_rm` | Stop an agent; remove a worktree (destructive). |
 | `orca_search` | Search past agent conversations. |
